@@ -1,6 +1,8 @@
 package report
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"math"
 	"strings"
@@ -27,6 +29,12 @@ type Finding struct {
 
 	// Captured secret
 	Secret string
+
+	// SecretHash is the SHA-256 hash of the unredacted Secret. It is only
+	// populated when findings are redacted so that redacted baselines can
+	// still tell when a secret has been rotated without storing the plaintext
+	// value.
+	SecretHash string `json:",omitempty"`
 
 	// File is the name of the file containing the finding
 	File        string
@@ -76,6 +84,9 @@ func (f *Finding) AddRequiredFindings(afs []*RequiredFinding) {
 
 // Redact removes sensitive information from a finding.
 func (f *Finding) Redact(percent uint) {
+	if f.SecretHash == "" {
+		f.SecretHash = HashSecret(f.Secret)
+	}
 	secret := maskSecret(f.Secret, percent)
 	if percent >= 100 {
 		secret = "REDACTED"
@@ -83,6 +94,17 @@ func (f *Finding) Redact(percent uint) {
 	f.Line = strings.ReplaceAll(f.Line, f.Secret, secret)
 	f.Match = strings.ReplaceAll(f.Match, f.Secret, secret)
 	f.Secret = secret
+}
+
+// HashSecret returns the SHA-256 hex digest of the given secret. The digest
+// allows redacted findings (and redacted baselines) to detect whether a
+// secret changed without ever persisting the plaintext value.
+func HashSecret(secret string) string {
+	if secret == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(secret))
+	return hex.EncodeToString(sum[:])
 }
 
 func maskSecret(secret string, percent uint) string {

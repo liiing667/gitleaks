@@ -205,6 +205,8 @@ gitleaks git --baseline-path gitleaks-report.json --report-path findings.json
 
 After running the detect command with the --baseline-path parameter, report output (findings.json) will only contain new issues.
 
+If a report is generated with `--redact`, each finding stores a SHA-256 digest of the original secret in `SecretHash` instead of the plaintext value. A subsequent scan with a redacted baseline can therefore still detect when a secret at the same rule, file and line has been rotated, while older redacted and plaintext baselines remain supported.
+
 ## Pre-Commit hook
 
 You can run Gitleaks as a pre-commit hook by copying the example `pre-commit.py` script into
