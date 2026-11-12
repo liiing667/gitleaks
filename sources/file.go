@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 
@@ -20,6 +22,14 @@ import (
 
 const defaultBufferSize = 100 * 1_000 // 100kb
 const InnerPathSeparator = "!"
+
+var (
+	errEmptyArchivePath     = errors.New("empty archive entry path")
+	errAbsoluteArchivePath  = errors.New("archive entry path is absolute")
+	errEscapingArchivePath  = errors.New("archive entry path escapes the archive root")
+	errAmbiguousArchivePath = errors.New("archive path contains the reserved separator " + InnerPathSeparator)
+	errInvalidArchivePath   = errors.New("archive entry path is not a valid logical path")
+)
 
 type seekReaderAt interface {
 	io.ReaderAt
@@ -74,6 +84,10 @@ func (s *File) Fragments(ctx context.Context, yield FragmentsFunc) error {
 
 			return nil
 		}
+		if err := validateArchiveContainerPath(s.Path); err != nil {
+			s.logArchivePathDiagnostic("", err)
+			return nil
+		}
 		if extractor, ok := format.(archives.Extractor); ok {
 			return s.extractorFragments(ctx, extractor, s.Content, yield)
 		}
@@ -116,22 +130,27 @@ func (s *File) extractorFragments(ctx context.Context, extractor archives.Extrac
 			return nil
 		}
 
+		innerPath, err := archiveEntryPath(d.NameInArchive)
+		if err != nil {
+			s.logArchivePathDiagnostic(d.NameInArchive, err)
+			return nil
+		}
+
+		if s.Config != nil && shouldSkipPath(s.Config, innerPath) {
+			logging.Debug().Str("path", s.FullPath()).Msg("skipping file: global allowlist")
+			return nil
+		}
+
 		innerReader, err := d.Open()
 		if err != nil {
 			logging.Error().Err(err).Str("path", s.FullPath()).Msg("could not open archive inner file")
 			return nil
 		}
 		defer innerReader.Close()
-		path := filepath.Clean(d.NameInArchive)
-
-		if s.Config != nil && shouldSkipPath(s.Config, path) {
-			logging.Debug().Str("path", s.FullPath()).Msg("skipping file: global allowlist")
-			return nil
-		}
 
 		file := &File{
 			Content:         innerReader,
-			Path:            path,
+			Path:            innerPath,
 			Symlink:         s.Symlink,
 			outerPaths:      append(s.outerPaths, filepath.ToSlash(s.Path)),
 			MaxArchiveDepth: s.MaxArchiveDepth,
@@ -144,6 +163,64 @@ func (s *File) extractorFragments(ctx context.Context, extractor archives.Extrac
 
 		return nil
 	})
+}
+
+// archiveEntryPath returns a normalized, non-escaping logical path for an
+// archive member. Archive member names are untrusted: they may be absolute,
+// contain traversal components, or use the inner path separator, which would
+// make allowlist matching and fingerprints ambiguous.
+func archiveEntryPath(name string) (string, error) {
+	if strings.ContainsRune(name, 0) {
+		return "", errInvalidArchivePath
+	}
+
+	// Archive formats use slash-separated names. Normalize backslashes too so
+	// the same member cannot mean different things on different platforms.
+	name = strings.ReplaceAll(name, `\`, "/")
+	cleanPath := path.Clean(name)
+
+	if cleanPath == "." || cleanPath == "" {
+		return "", errEmptyArchivePath
+	}
+	if path.IsAbs(cleanPath) || hasWindowsVolumePrefix(cleanPath) {
+		return "", errAbsoluteArchivePath
+	}
+	if cleanPath == ".." || strings.HasPrefix(cleanPath, "../") {
+		return "", errEscapingArchivePath
+	}
+	if strings.Contains(cleanPath, InnerPathSeparator) {
+		return "", errAmbiguousArchivePath
+	}
+
+	return cleanPath, nil
+}
+
+// validateArchiveContainerPath ensures the path leading to an archive cannot
+// be confused with the separator used for paths inside the archive.
+func validateArchiveContainerPath(containerPath string) error {
+	if strings.Contains(filepath.ToSlash(containerPath), InnerPathSeparator) {
+		return errAmbiguousArchivePath
+	}
+	return nil
+}
+
+// hasWindowsVolumePrefix reports whether p starts with a Windows drive
+// prefix. path.Clean is intentionally platform-independent, so Windows paths
+// must be rejected explicitly even when scanning on Unix.
+func hasWindowsVolumePrefix(p string) bool {
+	if len(p) >= 2 && p[1] == ':' {
+		c := p[0]
+		return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+	}
+	return false
+}
+
+func (s *File) logArchivePathDiagnostic(entry string, err error) {
+	logging.Warn().
+		Str("path", s.FullPath()).
+		Str("archive_entry", entry).
+		Str("reason", err.Error()).
+		Msg("skipping archive path: unsafe or ambiguous")
 }
 
 // decompressorFragments recursively crawls archives and yields fragments

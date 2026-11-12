@@ -543,6 +543,10 @@ sets the potential to go that deep. It will only go as deep as it needs to.
 The findings for secrets located within an archive will include the path to the
 file inside the archive. Inner paths are separated with `!`.
 
+Archive member names are treated as logical paths. Entries that are absolute,
+escape the archive root, or contain the `!` separator are skipped and logged
+with a structured diagnostic so they cannot affect allowlists or fingerprints.
+
 Example finding (shortened for brevity):
 
 ```
