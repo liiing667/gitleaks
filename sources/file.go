@@ -122,7 +122,20 @@ func (s *File) extractorFragments(ctx context.Context, extractor archives.Extrac
 			return nil
 		}
 		defer innerReader.Close()
-		path := filepath.Clean(d.NameInArchive)
+
+		// Map the raw member name onto a deterministic, non-escaping logical
+		// path. Unsafe or undecidable names are skipped with a structured
+		// diagnostic instead of being fed to the allowlist/fingerprint.
+		path, err := secureArchivePath(d.NameInArchive)
+		if err != nil {
+			logging.Warn().
+				Err(err).
+				Str("path", s.FullPath()).
+				Str("archive_member", d.NameInArchive).
+				Int("archive_depth", s.archiveDepth+1).
+				Msg("skipping archive member: unsafe path")
+			return nil
+		}
 
 		if s.Config != nil && shouldSkipPath(s.Config, path) {
 			logging.Debug().Str("path", s.FullPath()).Msg("skipping file: global allowlist")
