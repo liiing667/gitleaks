@@ -1,0 +1,17 @@
+[
+ {
+  "RuleID": "aws-access-key",
+  "Description": "AWS Access Key",
+  "StartLine": 99,
+  "EndLine": 99,
+  "StartColumn": 16,
+  "EndColumn": 35,
+  "Match": "REDACTED",
+  "Secret": "REDACTED",
+  "SecretHash": "d3f1fdd46da999d0cf69893e50e0b505c7f4db17b267f0767db992072e065470",
+  "File": "../testdata/baseline/redact/secret.go",
+  "Entropy": 3.0841837,
+  "Tags": ["key", "AWS"],
+  "Fingerprint": "../testdata/baseline/redact/secret.go:aws-access-key:99"
+ }
+]

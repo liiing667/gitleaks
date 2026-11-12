@@ -153,6 +153,140 @@ func TestIsNew(t *testing.T) {
 	}
 }
 
+func TestIsNewSecretHash(t *testing.T) {
+	t.Parallel()
+
+	const (
+		oldHash = "a2c4ff05ed30cc636a1e9f7e594bc3d791512048ab6fc184b72213aa36ced8de"
+		newHash = "1b103bb8f25eadb1286762c6d2653ee2e2591b68bdb848c5c535530d1ea35277"
+	)
+
+	meta := func() report.Finding {
+		return report.Finding{
+			RuleID:      "test-rule",
+			Description: "test description",
+			StartLine:   7,
+			EndLine:     7,
+			StartColumn: 10,
+			EndColumn:   30,
+			File:        "auth.py",
+			Entropy:     4.2,
+		}
+	}
+
+	tests := map[string]struct {
+		finding  report.Finding
+		redact   uint
+		baseline report.Finding
+		expect   bool
+	}{
+		"redacted scan, same hash, suppressed": {
+			finding: func() report.Finding {
+				f := meta()
+				f.Secret, f.Match, f.SecretHash = "REDACTED", "REDACTED", oldHash
+				return f
+			}(),
+			redact: 100,
+			baseline: func() report.Finding {
+				f := meta()
+				f.Secret, f.Match, f.SecretHash = "REDACTED", "REDACTED", oldHash
+				return f
+			}(),
+			expect: false,
+		},
+		"redacted scan, rotated secret hash, reported as new": {
+			finding: func() report.Finding {
+				f := meta()
+				f.Secret, f.Match, f.SecretHash = "REDACTED", "REDACTED", newHash
+				return f
+			}(),
+			redact: 100,
+			baseline: func() report.Finding {
+				f := meta()
+				f.Secret, f.Match, f.SecretHash = "REDACTED", "REDACTED", oldHash
+				return f
+			}(),
+			expect: true,
+		},
+		"partial redaction still uses the hash": {
+			finding: func() report.Finding {
+				f := meta()
+				f.Secret, f.Match, f.SecretHash = "token-ab...", "token-ab...", newHash
+				return f
+			}(),
+			redact: 75,
+			baseline: func() report.Finding {
+				f := meta()
+				f.Secret, f.Match, f.SecretHash = "token-ab...", "token-ab...", oldHash
+				return f
+			}(),
+			expect: true,
+		},
+		"hash mismatch but moved line is still new": {
+			finding: func() report.Finding { f := meta(); f.StartLine, f.EndLine = 8, 8; f.SecretHash = oldHash; return f }(),
+			redact:  100,
+			baseline: func() report.Finding {
+				f := meta()
+				f.Secret, f.Match, f.SecretHash = "REDACTED", "REDACTED", oldHash
+				return f
+			}(),
+			expect: true,
+		},
+		"legacy redacted baseline without hash stays permissive": {
+			finding: func() report.Finding {
+				f := meta()
+				f.Secret, f.Match, f.SecretHash = "REDACTED", "REDACTED", oldHash
+				return f
+			}(),
+			redact: 100,
+			baseline: func() report.Finding {
+				f := meta()
+				f.Secret, f.Match = "********************", "********************"
+				return f
+			}(),
+			expect: false,
+		},
+		"unredacted legacy baseline, redacted scan without hash, permissive fallback": {
+			finding: func() report.Finding { f := meta(); f.Secret, f.Match = "REDACTED", "REDACTED"; return f }(),
+			redact:  100,
+			baseline: func() report.Finding {
+				f := meta()
+				f.Secret, f.Match = "some-other-secret", "some-other-secret"
+				return f
+			}(),
+			expect: false, // redacted side carries no hash and no plaintext, so historical behaviour is preserved
+		},
+		"unredacted scan requires exact plaintext match": {
+			finding:  func() report.Finding { f := meta(); f.Secret, f.Match = "token-new", "token-new"; return f }(),
+			redact:   0,
+			baseline: func() report.Finding { f := meta(); f.Secret, f.Match = "token-old", "token-old"; return f }(),
+			expect:   true,
+		},
+		"unredacted scan with equal plaintext is suppressed": {
+			finding:  func() report.Finding { f := meta(); f.Secret, f.Match = "token", "token"; return f }(),
+			redact:   0,
+			baseline: func() report.Finding { f := meta(); f.Secret, f.Match = "token", "token"; return f }(),
+			expect:   false,
+		},
+		"redacted finding without hash against hashed baseline stays permissive": {
+			finding: func() report.Finding { f := meta(); f.Secret, f.Match = "REDACTED", "REDACTED"; return f }(),
+			redact:  100,
+			baseline: func() report.Finding {
+				f := meta()
+				f.Secret, f.Match, f.SecretHash = "REDACTED", "REDACTED", oldHash
+				return f
+			}(),
+			expect: false,
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, tt.expect, IsNew(tt.finding, tt.redact, []report.Finding{tt.baseline}))
+		})
+	}
+}
+
 func TestFileLoadBaseline(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

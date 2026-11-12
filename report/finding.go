@@ -1,6 +1,8 @@
 package report
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"math"
 	"strings"
@@ -27,6 +29,12 @@ type Finding struct {
 
 	// Captured secret
 	Secret string
+
+	// SecretHash is the SHA-256 hash of the unredacted Secret (and Match),
+	// captured before redaction masks the plaintext. It allows redacted
+	// baselines to detect when a secret value has been rotated without ever
+	// persisting the plaintext secret.
+	SecretHash string `json:",omitempty"`
 
 	// File is the name of the file containing the finding
 	File        string
@@ -76,6 +84,14 @@ func (f *Finding) AddRequiredFindings(afs []*RequiredFinding) {
 
 // Redact removes sensitive information from a finding.
 func (f *Finding) Redact(percent uint) {
+	// Capture a non-reversible fingerprint of the plaintext values before they
+	// are masked. This is what makes redacted baselines value-aware: a rotated
+	// secret produces a different hash and therefore can no longer be skipped
+	// via the old baseline entry, while no plaintext is written back.
+	if f.SecretHash == "" {
+		f.SecretHash = HashSecret(f.Secret, f.Match)
+	}
+
 	secret := maskSecret(f.Secret, percent)
 	if percent >= 100 {
 		secret = "REDACTED"
@@ -83,6 +99,17 @@ func (f *Finding) Redact(percent uint) {
 	f.Line = strings.ReplaceAll(f.Line, f.Secret, secret)
 	f.Match = strings.ReplaceAll(f.Match, f.Secret, secret)
 	f.Secret = secret
+}
+
+// HashSecret returns a hex-encoded SHA-256 digest of the unredacted secret
+// and match values. The digest never contains the plaintext and can safely be
+// persisted in a redacted report/baseline.
+func HashSecret(secret string, match string) string {
+	hasher := sha256.New()
+	hasher.Write([]byte(secret))
+	hasher.Write([]byte{0})
+	hasher.Write([]byte(match))
+	return hex.EncodeToString(hasher.Sum(nil))
 }
 
 func maskSecret(secret string, percent uint) string {

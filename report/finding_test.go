@@ -22,11 +22,35 @@ func TestRedact(t *testing.T) {
 	}
 	for _, test := range tests {
 		for _, f := range test.findings {
+			finding := f
 			f.Redact(100)
 			assert.Equal(t, "REDACTED", f.Secret)
 			assert.Equal(t, "line containing REDACTED", f.Match)
+			assert.NotEmpty(t, f.SecretHash)
+			assert.NotContains(t, f.SecretHash, "secret")
+			// Redact must not recompute an existing hash, which keeps the
+			// value stable across repeated/partial redaction.
+			existing := f.SecretHash
+			finding.Redact(50)
+			assert.Equal(t, existing, finding.SecretHash)
 		}
 	}
+}
+
+func TestHashSecret(t *testing.T) {
+	first := HashSecret("secret", "line containing secret")
+	second := HashSecret("secret", "line containing secret")
+
+	assert.Equal(t, 64, len(first))
+	assert.Equal(t, first, second)
+
+	rotated := HashSecret("rotated", "line containing rotated")
+	assert.NotEqual(t, first, rotated)
+
+	// A different match context with the same secret also differs, so the
+	// hash tracks the full redacted value pair, not only the captured secret.
+	otherMatch := HashSecret("secret", "other context secret")
+	assert.NotEqual(t, first, otherMatch)
 }
 
 func TestMask(t *testing.T) {

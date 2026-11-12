@@ -733,11 +733,21 @@ func (d *Detector) AddFinding(finding report.Finding) {
 		}
 	}
 
-	if d.baseline != nil && !IsNew(finding, d.Redact, d.baseline) {
-		logger.Debug().
-			Str("fingerprint", finding.Fingerprint).
-			Msgf("skipping finding: baseline")
-		return
+	if d.baseline != nil {
+		// Redaction only happens later in filter(), but a redacted baseline
+		// comparison needs the pre-redaction secret hash. Compute it on a copy
+		// here so the plaintext finding remains unchanged; Redact() reuses the
+		// stored hash when the finding is eventually masked for output.
+		baselineCandidate := finding
+		if d.Redact > 0 && baselineCandidate.SecretHash == "" {
+			baselineCandidate.SecretHash = report.HashSecret(baselineCandidate.Secret, baselineCandidate.Match)
+		}
+		if !IsNew(baselineCandidate, d.Redact, d.baseline) {
+			logger.Debug().
+				Str("fingerprint", finding.Fingerprint).
+				Msgf("skipping finding: baseline")
+			return
+		}
 	}
 
 	d.findingMutex.Lock()
