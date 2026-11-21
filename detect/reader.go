@@ -13,10 +13,12 @@ import (
 // Deprecated: Use sources.File with no path defined and Detector.DetectSource instead
 func (d *Detector) DetectReader(r io.Reader, bufSize int) ([]report.Finding, error) {
 	var findings []report.Finding
+	scan := d.newScanDetector()
 	file := sources.File{
 		Content:         r,
 		Buffer:          make([]byte, 1000*bufSize),
-		MaxArchiveDepth: d.MaxArchiveDepth,
+		Config:          &scan.Config,
+		MaxArchiveDepth: scan.MaxArchiveDepth,
 	}
 
 	ctx := context.Background()
@@ -25,10 +27,10 @@ func (d *Detector) DetectReader(r io.Reader, bufSize int) ([]report.Finding, err
 			return err
 		}
 
-		for _, finding := range d.Detect(Fragment(fragment)) {
+		for _, finding := range scan.detectContext(ctx, Fragment(fragment)) {
 			findings = append(findings, finding)
-			if d.Verbose {
-				printFinding(finding, d.NoColor)
+			if scan.Verbose {
+				printFinding(finding, scan.NoColor)
 			}
 		}
 
@@ -76,10 +78,12 @@ func (d *Detector) DetectReader(r io.Reader, bufSize int) ([]report.Finding, err
 func (d *Detector) StreamDetectReader(r io.Reader, bufSize int) (<-chan report.Finding, <-chan error) {
 	findingsCh := make(chan report.Finding, 1)
 	errCh := make(chan error, 1)
+	scan := d.newScanDetector()
 	file := sources.File{
 		Content:         r,
 		Buffer:          make([]byte, 1000*bufSize),
-		MaxArchiveDepth: d.MaxArchiveDepth,
+		Config:          &scan.Config,
+		MaxArchiveDepth: scan.MaxArchiveDepth,
 	}
 
 	go func() {
@@ -92,10 +96,10 @@ func (d *Detector) StreamDetectReader(r io.Reader, bufSize int) (<-chan report.F
 				return err
 			}
 
-			for _, finding := range d.Detect(Fragment(fragment)) {
+			for _, finding := range scan.detectContext(ctx, Fragment(fragment)) {
 				findingsCh <- finding
-				if d.Verbose {
-					printFinding(finding, d.NoColor)
+				if scan.Verbose {
+					printFinding(finding, scan.NoColor)
 				}
 			}
 

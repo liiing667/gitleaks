@@ -48,6 +48,11 @@ type File struct {
 	archiveDepth int
 }
 
+// SetConfig replaces the configuration used for path allowlists.
+func (s *File) SetConfig(cfg *config.Config) {
+	s.Config = cfg
+}
+
 // Fragments yields fragments for the this source
 func (s *File) Fragments(ctx context.Context, yield FragmentsFunc) error {
 	format, _, err := archives.Identify(ctx, s.Path, nil)

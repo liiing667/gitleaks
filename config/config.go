@@ -1,10 +1,13 @@
 package config
 
 import (
+	"crypto/sha256"
 	_ "embed"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	gv "github.com/hashicorp/go-version"
@@ -19,8 +22,9 @@ var (
 	//go:embed gitleaks.toml
 	DefaultConfig string
 
-	// use to keep track of how many configs we can extend
-	// yea I know, globals bad
+	// extendDepth is retained for source compatibility. Translation now
+	// carries the extension depth explicitly so concurrent config loads cannot
+	// share parser state.
 	extendDepth int
 )
 
@@ -60,6 +64,7 @@ type ViperConfig struct {
 	MinVersion string
 
 	configPath string
+	pathSet    bool
 }
 
 type viperRequired struct {
@@ -88,6 +93,10 @@ type Config struct {
 	Title       string
 	Extend      Extend
 	Path        string
+	// Version is a deterministic fingerprint of the complete, effective
+	// configuration. It is computed after extension and validation, so every
+	// rule and allowlist used by a scan is represented by the same version.
+	Version     string
 	Description string
 	Rules       map[string]Rule
 	Keywords    map[string]struct{}
@@ -107,6 +116,23 @@ type Extend struct {
 }
 
 func (vc *ViperConfig) Translate() (Config, error) {
+	return vc.translate(0)
+}
+
+// SetConfigPath sets the source path used to resolve relative extends and to
+// identify the config in reports. It also prevents Translate from falling back
+// to Viper's process-global ConfigFileUsed value.
+func (vc *ViperConfig) SetConfigPath(path string) {
+	vc.configPath = path
+	vc.pathSet = true
+}
+
+func (vc *ViperConfig) translate(depth int) (Config, error) {
+	if depth == 0 && !vc.pathSet {
+		vc.configPath = viper.ConfigFileUsed()
+		vc.pathSet = true
+	}
+
 	var (
 		keywords       = make(map[string]struct{})
 		orderedRules   []string
@@ -204,14 +230,7 @@ func (vc *ViperConfig) Translate() (Config, error) {
 		MinVersion:   vc.MinVersion,
 	}
 
-	if extendDepth > 0 {
-		// annoying hack to set the current config with the extended path
-		// since if extendDepth > 0 we are operating an extended config.
-		c.Path = vc.configPath
-	} else {
-		// I don't love this
-		c.Path = viper.ConfigFileUsed()
-	}
+	c.Path = vc.configPath
 
 	if err := validateMinVersion(c.MinVersion, c.Path); err != nil {
 		return Config{}, err
@@ -241,18 +260,18 @@ func (vc *ViperConfig) Translate() (Config, error) {
 		}
 	}
 
-	currentExtendDepth := extendDepth
+	currentExtendDepth := depth
 	if maxExtendDepth != currentExtendDepth {
 		// disallow both usedefault and path from being set
 		if c.Extend.Path != "" && c.Extend.UseDefault {
 			return Config{}, errors.New("unable to load config due to extend.path and extend.useDefault being set")
 		}
 		if c.Extend.UseDefault {
-			if err := c.extendDefault(vc); err != nil {
+			if err := c.extendDefault(depth + 1); err != nil {
 				return Config{}, err
 			}
 		} else if c.Extend.Path != "" {
-			if err := c.extendPath(vc); err != nil {
+			if err := c.extendPath(depth + 1); err != nil {
 				return Config{}, err
 			}
 		}
@@ -277,6 +296,7 @@ func (vc *ViperConfig) Translate() (Config, error) {
 		}
 	}
 
+	c.Version = c.computeVersion()
 	return c, nil
 }
 
@@ -372,17 +392,268 @@ func (c *Config) GetOrderedRules() []Rule {
 	return orderedRules
 }
 
-func (c *Config) extendDefault(parent *ViperConfig) error {
-	extendDepth++
-	viper.SetConfigType("toml")
-	if err := viper.ReadConfig(strings.NewReader(DefaultConfig)); err != nil {
+// LoadConfig loads and translates a configuration from a file.
+//
+// Unlike translating a ViperConfig that was populated through Viper's global
+// instance, LoadConfig keeps all parser state local to the call.
+func LoadConfig(path string) (Config, error) {
+	loaded := viper.New()
+	loaded.SetConfigType("toml")
+	loaded.SetConfigFile(path)
+	if err := loaded.ReadInConfig(); err != nil {
+		return Config{}, err
+	}
+
+	var vc ViperConfig
+	if err := loaded.Unmarshal(&vc); err != nil {
+		return Config{}, err
+	}
+	vc.configPath = path
+	vc.pathSet = true
+	return vc.Translate()
+}
+
+// ParseConfig parses and translates a TOML configuration from memory.
+func ParseConfig(content []byte) (Config, error) {
+	loaded := viper.New()
+	loaded.SetConfigType("toml")
+	if err := loaded.ReadConfig(strings.NewReader(string(content))); err != nil {
+		return Config{}, err
+	}
+
+	var vc ViperConfig
+	if err := loaded.Unmarshal(&vc); err != nil {
+		return Config{}, err
+	}
+	vc.pathSet = true
+	return vc.Translate()
+}
+
+// Clone returns a deep copy of the configuration. Compiled regular expressions
+// are immutable and are intentionally shared.
+func (c Config) Clone() Config {
+	clone := c
+	clone.Extend.DisabledRules = append([]string(nil), c.Extend.DisabledRules...)
+	clone.OrderedRules = append([]string(nil), c.OrderedRules...)
+	clone.Allowlists = cloneAllowlists(c.Allowlists)
+
+	clone.Rules = make(map[string]Rule, len(c.Rules))
+	for id, rule := range c.Rules {
+		clone.Rules[id] = cloneRule(rule)
+	}
+
+	clone.Keywords = make(map[string]struct{}, len(c.Keywords))
+	for keyword := range c.Keywords {
+		clone.Keywords[keyword] = struct{}{}
+	}
+	return clone
+}
+
+// Snapshot returns an immutable deep copy with a version computed from its
+// complete effective contents. Scans should use a snapshot so later config
+// edits cannot change the rules or allowlists midway through the scan.
+func (c Config) Snapshot() Config {
+	snapshot := c.Clone()
+	snapshot.Version = snapshot.computeVersion()
+	return snapshot
+}
+
+// RefreshVersion updates Version to match the current effective contents.
+func (c *Config) RefreshVersion() {
+	c.Version = c.computeVersion()
+}
+
+func cloneRule(rule Rule) Rule {
+	clone := rule
+	clone.Tags = append([]string(nil), rule.Tags...)
+	clone.Keywords = append([]string(nil), rule.Keywords...)
+	clone.Allowlists = cloneAllowlists(rule.Allowlists)
+	if rule.RequiredRules != nil {
+		clone.RequiredRules = make([]*Required, len(rule.RequiredRules))
+		for i, required := range rule.RequiredRules {
+			if required == nil {
+				continue
+			}
+			requiredClone := *required
+			clone.RequiredRules[i] = &requiredClone
+		}
+	}
+	return clone
+}
+
+func cloneAllowlists(allowlists []*Allowlist) []*Allowlist {
+	if allowlists == nil {
+		return nil
+	}
+	clones := make([]*Allowlist, len(allowlists))
+	for i, allowlist := range allowlists {
+		if allowlist == nil {
+			continue
+		}
+		clone := *allowlist
+		clone.Commits = append([]string(nil), allowlist.Commits...)
+		clone.Paths = append([]*regexp.Regexp(nil), allowlist.Paths...)
+		clone.Regexes = append([]*regexp.Regexp(nil), allowlist.Regexes...)
+		clone.StopWords = append([]string(nil), allowlist.StopWords...)
+		clones[i] = &clone
+	}
+	return clones
+}
+
+func (c Config) computeVersion() string {
+	hash := sha256.New()
+	write := func(key, value string) {
+		_, _ = fmt.Fprintf(hash, "%s=%d:%s\n", key, len(value), value)
+	}
+
+	write("title", c.Title)
+	write("description", c.Description)
+	write("minVersion", c.MinVersion)
+	write("keywords", strings.Join(sortedStrings(mapKeys(c.Keywords)), "\x00"))
+
+	ruleIDs := make([]string, 0, len(c.Rules))
+	for id := range c.Rules {
+		ruleIDs = append(ruleIDs, id)
+	}
+	sort.Strings(ruleIDs)
+	for _, id := range ruleIDs {
+		write("rule:"+id, canonicalRule(c.Rules[id]))
+	}
+
+	allowlists := make([]string, 0, len(c.Allowlists))
+	for _, allowlist := range c.Allowlists {
+		allowlists = append(allowlists, canonicalAllowlist(allowlist))
+	}
+	sort.Strings(allowlists)
+	for i, allowlist := range allowlists {
+		write("allowlist:"+strconv.Itoa(i), allowlist)
+	}
+
+	return "sha256:" + hex.EncodeToString(hash.Sum(nil))
+}
+
+func canonicalRule(rule Rule) string {
+	var b strings.Builder
+	write := func(key, value string) {
+		_, _ = fmt.Fprintf(&b, "%s=%d:%s\n", key, len(value), value)
+	}
+
+	write("id", rule.RuleID)
+	write("description", rule.Description)
+	write("regex", regexpString(rule.Regex))
+	write("path", regexpString(rule.Path))
+	write("entropy", strconv.FormatFloat(rule.Entropy, 'g', -1, 64))
+	write("secretGroup", strconv.Itoa(rule.SecretGroup))
+	write("skipReport", strconv.FormatBool(rule.SkipReport))
+	write("tags", strings.Join(sortedStrings(rule.Tags), "\x00"))
+	write("keywords", strings.Join(sortedStrings(rule.Keywords), "\x00"))
+
+	allowlists := make([]string, 0, len(rule.Allowlists))
+	for _, allowlist := range rule.Allowlists {
+		allowlists = append(allowlists, canonicalAllowlist(allowlist))
+	}
+	sort.Strings(allowlists)
+	for i, allowlist := range allowlists {
+		write("allowlist:"+strconv.Itoa(i), allowlist)
+	}
+
+	required := make([]string, 0, len(rule.RequiredRules))
+	for _, requiredRule := range rule.RequiredRules {
+		if requiredRule == nil {
+			continue
+		}
+		var rb strings.Builder
+		_, _ = fmt.Fprintf(&rb, "id=%d:%s\n", len(requiredRule.RuleID), requiredRule.RuleID)
+		_, _ = fmt.Fprintf(&rb, "withinLines=%s\n", optionalInt(requiredRule.WithinLines))
+		_, _ = fmt.Fprintf(&rb, "withinColumns=%s\n", optionalInt(requiredRule.WithinColumns))
+		required = append(required, rb.String())
+	}
+	sort.Strings(required)
+	for i, requiredRule := range required {
+		write("required:"+strconv.Itoa(i), requiredRule)
+	}
+
+	return b.String()
+}
+
+func canonicalAllowlist(allowlist *Allowlist) string {
+	if allowlist == nil {
+		return ""
+	}
+
+	var b strings.Builder
+	write := func(key, value string) {
+		_, _ = fmt.Fprintf(&b, "%s=%d:%s\n", key, len(value), value)
+	}
+
+	write("description", allowlist.Description)
+	condition := "OR"
+	if allowlist.MatchCondition == AllowlistMatchAnd {
+		condition = "AND"
+	}
+	write("condition", condition)
+	write("regexTarget", allowlist.RegexTarget)
+	write("commits", strings.Join(sortedStrings(allowlist.Commits), "\x00"))
+	write("stopwords", strings.Join(sortedStrings(allowlist.StopWords), "\x00"))
+
+	paths := make([]string, 0, len(allowlist.Paths))
+	for _, path := range allowlist.Paths {
+		paths = append(paths, regexpString(path))
+	}
+	sort.Strings(paths)
+	write("paths", strings.Join(paths, "\x00"))
+
+	regexes := make([]string, 0, len(allowlist.Regexes))
+	for _, regex := range allowlist.Regexes {
+		regexes = append(regexes, regexpString(regex))
+	}
+	sort.Strings(regexes)
+	write("regexes", strings.Join(regexes, "\x00"))
+
+	return b.String()
+}
+
+func regexpString(regex *regexp.Regexp) string {
+	if regex == nil {
+		return ""
+	}
+	return regex.String()
+}
+
+func sortedStrings(values []string) []string {
+	sorted := append([]string(nil), values...)
+	sort.Strings(sorted)
+	return sorted
+}
+
+func mapKeys(values map[string]struct{}) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	return keys
+}
+
+func optionalInt(value *int) string {
+	if value == nil {
+		return ""
+	}
+	return strconv.Itoa(*value)
+}
+
+func (c *Config) extendDefault(depth int) error {
+	loaded := viper.New()
+	loaded.SetConfigType("toml")
+	if err := loaded.ReadConfig(strings.NewReader(DefaultConfig)); err != nil {
 		return fmt.Errorf("failed to load extended default config, err: %w", err)
 	}
 	defaultViperConfig := ViperConfig{}
-	if err := viper.Unmarshal(&defaultViperConfig); err != nil {
+	if err := loaded.Unmarshal(&defaultViperConfig); err != nil {
 		return fmt.Errorf("failed to load extended default config, err: %w", err)
 	}
-	cfg, err := defaultViperConfig.Translate()
+	// The default config is embedded, so it has no filesystem path.
+	defaultViperConfig.pathSet = true
+	cfg, err := defaultViperConfig.translate(depth)
 	if err != nil {
 		return fmt.Errorf("failed to load extended default config, err: %w", err)
 
@@ -392,20 +663,24 @@ func (c *Config) extendDefault(parent *ViperConfig) error {
 	return nil
 }
 
-func (c *Config) extendPath(parent *ViperConfig) error {
-	extendDepth++
-	viper.SetConfigFile(c.Extend.Path)
-	if err := viper.ReadInConfig(); err != nil {
+func (c *Config) extendPath(depth int) error {
+	// Use a dedicated Viper instance so loading an extended config cannot
+	// replace the global parser state used by another config translation.
+	loaded := viper.New()
+	loaded.SetConfigType("toml")
+	loaded.SetConfigFile(c.Extend.Path)
+	if err := loaded.ReadInConfig(); err != nil {
 		return fmt.Errorf("failed to load extended config, err: %w", err)
 	}
 	extensionViperConfig := ViperConfig{}
-	if err := viper.Unmarshal(&extensionViperConfig); err != nil {
+	if err := loaded.Unmarshal(&extensionViperConfig); err != nil {
 		return fmt.Errorf("failed to load extended config, err: %w", err)
 	}
 
 	extensionViperConfig.configPath = c.Extend.Path
+	extensionViperConfig.pathSet = true
 	logging.Debug().Msgf("extending config with %s", c.Extend.Path)
-	cfg, err := extensionViperConfig.Translate()
+	cfg, err := extensionViperConfig.translate(depth)
 	if err != nil {
 		return fmt.Errorf("failed to load extended config, err: %w", err)
 	}

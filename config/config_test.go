@@ -2,6 +2,7 @@ package config
 
 import (
 	"errors"
+	"path/filepath"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -669,4 +670,28 @@ func TestExtendedRuleKeywordsAreDowncase(t *testing.T) {
 			require.Truef(t, exists, "The expected keyword %s did not exist as a key of cfg.Keywords", tt.expectedKeywords)
 		})
 	}
+}
+
+func TestConfigVersionAndSnapshot(t *testing.T) {
+	cfg, err := LoadConfig(filepath.Join(configPath, "simple.toml"))
+	require.NoError(t, err)
+	require.NotEmpty(t, cfg.Version)
+
+	reloaded, err := LoadConfig(filepath.Join(configPath, "simple.toml"))
+	require.NoError(t, err)
+	require.Equal(t, cfg.Version, reloaded.Version)
+
+	snapshot := cfg.Snapshot()
+	rule := snapshot.Rules["aws-access-key"]
+	rule.Keywords = append(rule.Keywords, "snapshot-only")
+	snapshot.Rules["aws-access-key"] = rule
+	snapshot.RefreshVersion()
+
+	require.NotEqual(t, cfg.Version, snapshot.Version)
+	require.NotContains(t, cfg.Rules["aws-access-key"].Keywords, "snapshot-only")
+
+	extended, err := LoadConfig(filepath.Join(configPath, "valid", "extend_rule_override_regex.toml"))
+	require.NoError(t, err)
+	require.NotEmpty(t, extended.Version)
+	require.NotEqual(t, cfg.Version, extended.Version)
 }

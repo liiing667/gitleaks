@@ -46,6 +46,17 @@ type Finding struct {
 	// unique identifier
 	Fingerprint string
 
+	// ConfigVersion identifies the complete effective configuration used by
+	// the scan that produced this finding.
+	ConfigVersion string `json:",omitempty"`
+	// ConfigPath is the source path of that configuration, when known.
+	ConfigPath string `json:",omitempty"`
+	// ScanSource identifies the source that was scanned (for example, the
+	// directory or repository path).
+	ScanSource string `json:",omitempty"`
+	// ConfigGeneration is the scan-local generation of ConfigVersion.
+	ConfigGeneration uint64 `json:",omitempty"`
+
 	// Fragment used for multi-part rule checking, CEL filtering,
 	// and eventually ML validation
 	Fragment *sources.Fragment `json:",omitempty"`

@@ -281,6 +281,7 @@ func Detector(cmd *cobra.Command, cfg config.Config, source string) *detect.Dete
 	if detector.Config.Path == "" {
 		detector.Config.Path = filepath.Join(source, ".gitleaks.toml")
 	}
+	detector.ConfigPath = detector.Config.Path
 	// set verbose flag
 	if detector.Verbose, err = cmd.Flags().GetBool("verbose"); err != nil {
 		logging.Fatal().Err(err).Send()
@@ -348,12 +349,16 @@ func Detector(cmd *cobra.Command, cfg config.Config, source string) *detect.Dete
 	reportPath := mustGetStringFlag(cmd, "report-path")
 	if reportPath != "" {
 		if reportPath != report.StdoutReportPath {
-			// Ensure the path is writable.
-			if f, err := os.Create(reportPath); err != nil {
+			// Ensure the report directory is writable without touching an
+			// existing report. A failed scan must leave the previous complete
+			// report untouched.
+			dir := filepath.Dir(reportPath)
+			if f, err := os.CreateTemp(dir, "."+filepath.Base(reportPath)+".check-*"); err != nil {
 				logging.Fatal().Err(err).Msgf("Report path is not writable: %s", reportPath)
 			} else {
+				name := f.Name()
 				_ = f.Close()
-				_ = os.Remove(reportPath)
+				_ = os.Remove(name)
 			}
 		}
 
@@ -467,24 +472,18 @@ func findingSummaryAndExit(detector *detect.Detector, findings []report.Finding,
 			reportErr error
 		)
 
+		reportFindings := detector.ReportFindings(findings)
+		if metadataReporter, ok := detector.Reporter.(report.MetadataReporter); ok {
+			metadataReporter.SetMetadata(detector.ScanMetadata())
+		}
+
 		if detector.ReportPath == report.StdoutReportPath {
 			file = os.Stdout
+			reportErr = detector.Reporter.Write(file, reportFindings)
 		} else {
-			// Open the file.
-			if file, reportErr = os.Create(detector.ReportPath); reportErr != nil {
-				goto ReportEnd
-			}
-			defer func() {
-				_ = file.Close()
-			}()
+			reportErr = writeReportAtomically(detector.ReportPath, detector.Reporter, reportFindings)
 		}
 
-		// Write to the file.
-		if reportErr = detector.Reporter.Write(file, findings); reportErr != nil {
-			goto ReportEnd
-		}
-
-	ReportEnd:
 		if reportErr != nil {
 			logging.Fatal().Err(reportErr).Msg("failed to write report")
 		}
@@ -497,6 +496,41 @@ func findingSummaryAndExit(detector *detect.Detector, findings []report.Finding,
 	if len(findings) != 0 {
 		os.Exit(exitCode)
 	}
+}
+
+func writeReportAtomically(path string, reporter report.Reporter, findings []report.Finding) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	removeTmp := true
+	defer func() {
+		if removeTmp {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if err := reporter.Write(tmp, findings); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	_ = os.Chmod(tmpPath, 0o644)
+	if err := os.Rename(tmpPath, path); err != nil {
+		// Windows does not replace an existing file with Rename. Fall back to
+		// removing the previous complete report and retrying the rename.
+		if removeErr := os.Remove(path); removeErr != nil {
+			return err
+		}
+		if err := os.Rename(tmpPath, path); err != nil {
+			return err
+		}
+	}
+	removeTmp = false
+	return nil
 }
 
 func fileExists(fileName string) bool {

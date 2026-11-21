@@ -194,6 +194,14 @@ func (c *GitCmd) String() string {
 	return c.cmd.String()
 }
 
+// RepoPath returns the repository path the command operates on.
+func (c *GitCmd) RepoPath() string {
+	if c == nil {
+		return ""
+	}
+	return c.repoPath
+}
+
 // NewBlobReader returns an io.ReadCloser that can be used to read a blob
 // within the git repo used to create the GitCmd.
 //
@@ -285,6 +293,11 @@ type Git struct {
 	MaxArchiveDepth int
 }
 
+// SetConfig replaces the configuration used for allowlists.
+func (s *Git) SetConfig(cfg *config.Config) {
+	s.Config = cfg
+}
+
 // CommitInfo captures metadata about the commit
 type CommitInfo struct {
 	AuthorEmail string
@@ -304,6 +317,7 @@ func (s *Git) Fragments(ctx context.Context, yield FragmentsFunc) error {
 	}()
 
 	var (
+		cfg         = snapshotConfig(s.Config)
 		diffFilesCh = s.Cmd.DiffFilesCh()
 		errCh       = s.Cmd.ErrCh()
 		wg          sync.WaitGroup
@@ -338,7 +352,7 @@ func (s *Git) Fragments(ctx context.Context, yield FragmentsFunc) error {
 			var commitInfo *CommitInfo
 			if gitdiffFile.PatchHeader != nil {
 				commitSHA = gitdiffFile.PatchHeader.SHA
-				for _, a := range s.Config.Allowlists {
+				for _, a := range cfg.Allowlists {
 					if ok, c := a.CommitAllowed(gitdiffFile.PatchHeader.SHA); ok {
 						logging.Trace().Str("allowed-commit", c).Msg("skipping commit: global allowlist")
 						continue
@@ -373,7 +387,7 @@ func (s *Git) Fragments(ctx context.Context, yield FragmentsFunc) error {
 						Content:         blob,
 						Path:            gitdiffFile.NewName,
 						MaxArchiveDepth: s.MaxArchiveDepth,
-						Config:          s.Config,
+						Config:          cfg,
 					}
 
 					// enrich and yield fragments

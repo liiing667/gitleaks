@@ -53,6 +53,14 @@ func shouldSkipPath(cfg *config.Config, path string) bool {
 	return false
 }
 
+func snapshotConfig(cfg *config.Config) *config.Config {
+	if cfg == nil {
+		return nil
+	}
+	snapshot := cfg.Snapshot()
+	return &snapshot
+}
+
 // readUntilSafeBoundary consumes |f| until it finds two consecutive `\n` characters, up to |maxPeekSize|.
 // This hopefully avoids splitting. (https://github.com/gitleaks/gitleaks/issues/1651)
 func readUntilSafeBoundary(r *bufio.Reader, n int, maxPeekSize int, peekBuf *bytes.Buffer) error {

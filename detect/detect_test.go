@@ -3,6 +3,7 @@ package detect
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -844,6 +845,98 @@ func captureStdout(f func()) string {
 	var buf bytes.Buffer
 	io.Copy(&buf, r)
 	return buf.String()
+}
+
+type snapshotTestSource struct {
+	fragments []sources.Fragment
+	before    func(int)
+	err       error
+}
+
+func (s *snapshotTestSource) Fragments(_ context.Context, yield sources.FragmentsFunc) error {
+	for i, fragment := range s.fragments {
+		if s.before != nil {
+			s.before(i)
+		}
+		if err := yield(fragment, nil); err != nil {
+			return err
+		}
+	}
+	return s.err
+}
+
+func TestDetectSourceUsesOneConfigSnapshot(t *testing.T) {
+	cfg := config.Config{
+		Rules: map[string]config.Rule{
+			"rule-a": {
+				RuleID: "rule-a",
+				Regex:  regexp.MustCompile(`SECRET_A`),
+			},
+		},
+		Keywords: map[string]struct{}{},
+	}
+	detector := NewDetector(cfg)
+
+	source := &snapshotTestSource{
+		fragments: []sources.Fragment{
+			{Raw: "SECRET_A", FilePath: "one.txt"},
+			{Raw: "SECRET_A", FilePath: "two.txt"},
+		},
+	}
+	source.before = func(index int) {
+		if index == 1 {
+			detector.Config.Rules = map[string]config.Rule{
+				"rule-b": {
+					RuleID: "rule-b",
+					Regex:  regexp.MustCompile(`SECRET_B`),
+				},
+			}
+		}
+	}
+
+	findings, err := detector.DetectSource(context.Background(), source)
+	require.NoError(t, err)
+	require.Len(t, findings, 2)
+	for _, finding := range findings {
+		assert.Equal(t, "rule-a", finding.RuleID)
+	}
+	require.Len(t, detector.Findings(), 2)
+	assert.NotEmpty(t, detector.Findings()[0].ConfigVersion)
+	assert.Equal(t, detector.ConfigVersion, detector.Findings()[0].ConfigVersion)
+}
+
+func TestDetectSourceFailureDoesNotPublishOldFindings(t *testing.T) {
+	cfg := config.Config{
+		Rules: map[string]config.Rule{
+			"rule-a": {
+				RuleID: "rule-a",
+				Regex:  regexp.MustCompile(`SECRET_A`),
+			},
+		},
+		Keywords: map[string]struct{}{},
+	}
+	detector := NewDetector(cfg)
+
+	failed := &snapshotTestSource{
+		fragments: []sources.Fragment{
+			{Raw: "SECRET_A", FilePath: "failed.txt"},
+		},
+		err: errors.New("scan failed"),
+	}
+	findings, err := detector.DetectSource(context.Background(), failed)
+	require.Error(t, err)
+	require.Empty(t, findings)
+	require.Empty(t, detector.Findings())
+
+	retry := &snapshotTestSource{
+		fragments: []sources.Fragment{
+			{Raw: "SECRET_A", FilePath: "retry.txt"},
+		},
+	}
+	findings, err = detector.DetectSource(context.Background(), retry)
+	require.NoError(t, err)
+	require.Len(t, findings, 1)
+	require.Len(t, detector.Findings(), 1)
 }
 
 // TestFromGit tests the FromGit function

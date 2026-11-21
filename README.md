@@ -570,6 +570,12 @@ are supported.
 
 Gitleaks has built-in support for several report formats: [`json`](https://github.com/gitleaks/gitleaks/blob/master/testdata/expected/report/json_simple.json), [`csv`](https://github.com/gitleaks/gitleaks/blob/master/testdata/expected/report/csv_simple.csv?plain=1), [`junit`](https://github.com/gitleaks/gitleaks/blob/master/testdata/expected/report/junit_simple.xml), and [`sarif`](https://github.com/gitleaks/gitleaks/blob/master/testdata/expected/report/sarif_simple.sarif).
 
+Findings produced by the CLI also include `ConfigVersion`, `ConfigPath`,
+`ScanSource`, and `ConfigGeneration`. `ConfigVersion` is a deterministic
+fingerprint of the complete effective configuration after any `extend`
+processing. All findings from one scan carry the same version, so reports can
+be tied back to the exact rules and allowlists that produced them.
+
 If none of these formats fit your need, you can create your own report format with a [Go `text/template` .tmpl file](https://www.digitalocean.com/community/tutorials/how-to-use-templates-in-go#step-4-writing-a-template) and the `--report-template` flag. The template can use [extended functionality from the `Masterminds/sprig` template library](https://masterminds.github.io/sprig/).
 
 For example, the following template provides a custom JSON output:

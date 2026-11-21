@@ -12,9 +12,15 @@ import (
 
 type TemplateReporter struct {
 	template *template.Template
+	Metadata ScanMetadata
 }
 
 var _ Reporter = (*TemplateReporter)(nil)
+var _ MetadataReporter = (*TemplateReporter)(nil)
+
+func (t *TemplateReporter) SetMetadata(metadata ScanMetadata) {
+	t.Metadata = metadata
+}
 
 func NewTemplateReporter(templatePath string) (*TemplateReporter, error) {
 	if templatePath == "" {
@@ -46,6 +52,7 @@ func NewTemplateReporter(templatePath string) (*TemplateReporter, error) {
 // writeTemplate renders the findings using the user-provided template.
 // https://www.digitalocean.com/community/tutorials/how-to-use-templates-in-go
 func (t *TemplateReporter) Write(w io.WriteCloser, findings []Finding) error {
+	findings = applyMetadata(findings, t.Metadata)
 	if err := t.template.Execute(w, findings); err != nil {
 		return err
 	}

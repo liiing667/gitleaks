@@ -8,11 +8,18 @@ import (
 )
 
 type CsvReporter struct {
+	Metadata ScanMetadata
 }
 
 var _ Reporter = (*CsvReporter)(nil)
+var _ MetadataReporter = (*CsvReporter)(nil)
+
+func (r *CsvReporter) SetMetadata(metadata ScanMetadata) {
+	r.Metadata = metadata
+}
 
 func (r *CsvReporter) Write(w io.WriteCloser, findings []Finding) error {
+	findings = applyMetadata(findings, r.Metadata)
 	if len(findings) == 0 {
 		return nil
 	}
@@ -42,6 +49,13 @@ func (r *CsvReporter) Write(w io.WriteCloser, findings []Finding) error {
 	if findings[0].Link != "" {
 		columns = append(columns, "Link")
 	}
+	includeMetadata := findings[0].ConfigVersion != "" ||
+		findings[0].ConfigPath != "" ||
+		findings[0].ScanSource != "" ||
+		findings[0].ConfigGeneration != 0
+	if includeMetadata {
+		columns = append(columns, "ConfigVersion", "ConfigPath", "ScanSource", "ConfigGeneration")
+	}
 
 	if err = cw.Write(columns); err != nil {
 		return err
@@ -66,6 +80,14 @@ func (r *CsvReporter) Write(w io.WriteCloser, findings []Finding) error {
 		}
 		if findings[0].Link != "" {
 			row = append(row, f.Link)
+		}
+		if includeMetadata {
+			row = append(row,
+				f.ConfigVersion,
+				f.ConfigPath,
+				f.ScanSource,
+				strconv.FormatUint(f.ConfigGeneration, 10),
+			)
 		}
 
 		if err = cw.Write(row); err != nil {

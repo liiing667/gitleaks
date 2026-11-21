@@ -9,11 +9,18 @@ import (
 )
 
 type JunitReporter struct {
+	Metadata ScanMetadata
 }
 
 var _ Reporter = (*JunitReporter)(nil)
+var _ MetadataReporter = (*JunitReporter)(nil)
+
+func (r *JunitReporter) SetMetadata(metadata ScanMetadata) {
+	r.Metadata = metadata
+}
 
 func (r *JunitReporter) Write(w io.WriteCloser, findings []Finding) error {
+	findings = applyMetadata(findings, r.Metadata)
 	testSuites := TestSuites{
 		TestSuites: getTestSuites(findings),
 	}

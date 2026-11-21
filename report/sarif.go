@@ -10,11 +10,18 @@ import (
 
 type SarifReporter struct {
 	OrderedRules []config.Rule
+	Metadata     ScanMetadata
 }
 
 var _ Reporter = (*SarifReporter)(nil)
+var _ MetadataReporter = (*SarifReporter)(nil)
+
+func (r *SarifReporter) SetMetadata(metadata ScanMetadata) {
+	r.Metadata = metadata
+}
 
 func (r *SarifReporter) Write(w io.WriteCloser, findings []Finding) error {
+	findings = applyMetadata(findings, r.Metadata)
 	sarif := Sarif{
 		Schema:  "https://json.schemastore.org/sarif-2.1.0.json",
 		Version: "2.1.0",
@@ -27,12 +34,22 @@ func (r *SarifReporter) Write(w io.WriteCloser, findings []Finding) error {
 }
 
 func (r *SarifReporter) getRuns(findings []Finding) []Runs {
-	return []Runs{
-		{
-			Tool:    r.getTool(),
-			Results: getResults(findings),
-		},
+	run := Runs{
+		Tool:    r.getTool(),
+		Results: getResults(findings),
 	}
+	if r.Metadata.ConfigVersion != "" ||
+		r.Metadata.ConfigPath != "" ||
+		r.Metadata.ScanSource != "" ||
+		r.Metadata.ConfigGeneration != 0 {
+		run.Properties = &ScanProperties{
+			ConfigVersion:    r.Metadata.ConfigVersion,
+			ConfigPath:       r.Metadata.ConfigPath,
+			ScanSource:       r.Metadata.ScanSource,
+			ConfigGeneration: r.Metadata.ConfigGeneration,
+		}
+	}
+	return []Runs{run}
 }
 
 func (r *SarifReporter) getTool() Tool {
@@ -99,7 +116,11 @@ func getResults(findings []Finding) []Results {
 				Author:        f.Author,
 			},
 			Properties: Properties{
-				Tags: f.Tags,
+				Tags:             f.Tags,
+				ConfigVersion:    f.ConfigVersion,
+				ConfigPath:       f.ConfigPath,
+				ScanSource:       f.ScanSource,
+				ConfigGeneration: f.ConfigGeneration,
 			},
 		}
 		results = append(results, r)
@@ -200,7 +221,18 @@ type Locations struct {
 }
 
 type Properties struct {
-	Tags []string `json:"tags"`
+	Tags             []string `json:"tags"`
+	ConfigVersion    string   `json:"configVersion,omitempty"`
+	ConfigPath       string   `json:"configPath,omitempty"`
+	ScanSource       string   `json:"scanSource,omitempty"`
+	ConfigGeneration uint64   `json:"configGeneration,omitempty"`
+}
+
+type ScanProperties struct {
+	ConfigVersion    string `json:"configVersion,omitempty"`
+	ConfigPath       string `json:"configPath,omitempty"`
+	ScanSource       string `json:"scanSource,omitempty"`
+	ConfigGeneration uint64 `json:"configGeneration,omitempty"`
 }
 
 type Results struct {
@@ -212,6 +244,7 @@ type Results struct {
 }
 
 type Runs struct {
-	Tool    Tool      `json:"tool"`
-	Results []Results `json:"results"`
+	Tool       Tool            `json:"tool"`
+	Results    []Results       `json:"results"`
+	Properties *ScanProperties `json:"properties,omitempty"`
 }

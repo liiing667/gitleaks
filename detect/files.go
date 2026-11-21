@@ -15,12 +15,22 @@ import (
 //
 // Deprecated: Use sources.Files and Detector.DetectSource instead
 func (d *Detector) DetectFiles(scanTargets <-chan sources.ScanTarget) ([]report.Finding, error) {
+	if d.scanMutex == nil {
+		d.scanMutex = &sync.Mutex{}
+	}
+	d.scanMutex.Lock()
+	defer d.scanMutex.Unlock()
+
+	scan := d.newScanDetector()
+	scan.Sema = d.Sema
+	scan.ConfigGeneration = d.generation.Add(1)
+	scan.ScanSource = "files"
 	var wg sync.WaitGroup
 
 	for scanTarget := range scanTargets {
 		wg.Add(1)
 
-		d.Sema.Go(func() error {
+		scan.Sema.Go(func() error {
 			defer wg.Done()
 
 			logger := logging.With().Str("path", scanTarget.Path).Logger()
@@ -52,12 +62,12 @@ func (d *Detector) DetectFiles(scanTargets <-chan sources.ScanTarget) ([]report.
 			}
 
 			// Too large; nothing to do here.
-			if d.MaxTargetMegaBytes > 0 {
+			if scan.MaxTargetMegaBytes > 0 {
 				rawLength := info.Size() / 1_000_000
-				if rawLength > int64(d.MaxTargetMegaBytes) {
+				if rawLength > int64(scan.MaxTargetMegaBytes) {
 					logger.Warn().Msgf(
 						"skipping file: too large max_size=%dMB, size=%dMB",
-						d.MaxTargetMegaBytes, rawLength,
+						scan.MaxTargetMegaBytes, rawLength,
 					)
 					return nil
 				}
@@ -68,8 +78,8 @@ func (d *Detector) DetectFiles(scanTargets <-chan sources.ScanTarget) ([]report.
 				Content:         f,
 				Path:            scanTarget.Path,
 				Symlink:         scanTarget.Symlink,
-				Config:          &d.Config,
-				MaxArchiveDepth: d.MaxArchiveDepth,
+				Config:          &scan.Config,
+				MaxArchiveDepth: scan.MaxArchiveDepth,
 			}
 
 			ctx := context.Background()
@@ -79,8 +89,8 @@ func (d *Detector) DetectFiles(scanTargets <-chan sources.ScanTarget) ([]report.
 					return nil
 				}
 
-				for _, finding := range d.Detect(Fragment(fragment)) {
-					d.AddFinding(finding)
+				for _, finding := range scan.detectContext(ctx, Fragment(fragment)) {
+					scan.AddFinding(finding)
 				}
 				return nil
 			})
@@ -88,5 +98,13 @@ func (d *Detector) DetectFiles(scanTargets <-chan sources.ScanTarget) ([]report.
 	}
 
 	wg.Wait()
-	return d.findings, nil
+	d.TotalBytes.Add(scan.TotalBytes.Load())
+	d.ConfigVersion = scan.ConfigVersion
+	d.ConfigPath = scan.ConfigPath
+	d.ScanSource = scan.ScanSource
+	d.ConfigGeneration = scan.ConfigGeneration
+	d.Config.Version = scan.ConfigVersion
+	findings := scan.Findings()
+	d.setFindings(d.ReportFindings(findings))
+	return findings, nil
 }

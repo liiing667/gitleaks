@@ -20,7 +20,6 @@ import (
 	ahocorasick "github.com/BobuSumisu/aho-corasick"
 	"github.com/fatih/semgroup"
 	"github.com/rs/zerolog"
-	"github.com/spf13/viper"
 	"golang.org/x/exp/maps"
 )
 
@@ -39,6 +38,21 @@ var (
 type Detector struct {
 	// Config is the configuration for the detector
 	Config config.Config
+
+	// ConfigVersion identifies the complete effective configuration used by
+	// the most recently admitted scan.
+	ConfigVersion string
+
+	// ConfigPath is the source path of that configuration.
+	ConfigPath string
+
+	// ScanSource identifies the source scanned by the most recently admitted
+	// scan.
+	ScanSource string
+
+	// ConfigGeneration is a detector-local generation for the most recently
+	// admitted scan.
+	ConfigGeneration uint64
 
 	// Redact is a flag to redact findings. This is exported
 	// so users using gitleaks as a library can set this flag
@@ -99,6 +113,12 @@ type Detector struct {
 	// Sema (https://github.com/fatih/semgroup) controls the concurrency
 	Sema *semgroup.Group
 
+	// scanMutex serializes source scans so a Detector never publishes a
+	// mixture of findings from two different scans.
+	scanMutex *sync.Mutex
+
+	generation atomic.Uint64
+
 	// report-related settings.
 	ReportPath string
 	Reporter   report.Reporter
@@ -119,35 +139,87 @@ func NewDetector(cfg config.Config) *Detector {
 // NewDetectorContext is the same as NewDetector but supports passing in a
 // context to use for timeouts
 func NewDetectorContext(ctx context.Context, cfg config.Config) *Detector {
+	snapshot := cfg.Snapshot()
 	return &Detector{
 		commitMap:      make(map[string]bool),
 		gitleaksIgnore: make(map[string]struct{}),
 		findingMutex:   &sync.Mutex{},
 		commitMutex:    &sync.Mutex{},
+		scanMutex:      &sync.Mutex{},
 		findings:       make([]report.Finding, 0),
-		Config:         cfg,
-		prefilter:      *ahocorasick.NewTrieBuilder().AddStrings(maps.Keys(cfg.Keywords)).Build(),
+		Config:         snapshot,
+		ConfigVersion:  snapshot.Version,
+		ConfigPath:     snapshot.Path,
+		prefilter:      *ahocorasick.NewTrieBuilder().AddStrings(maps.Keys(snapshot.Keywords)).Build(),
 		Sema:           semgroup.NewGroup(ctx, 40),
 	}
 }
 
 // NewDetectorDefaultConfig creates a new detector with the default config
 func NewDetectorDefaultConfig() (*Detector, error) {
-	viper.SetConfigType("toml")
-	err := viper.ReadConfig(strings.NewReader(config.DefaultConfig))
-	if err != nil {
-		return nil, err
-	}
-	var vc config.ViperConfig
-	err = viper.Unmarshal(&vc)
-	if err != nil {
-		return nil, err
-	}
-	cfg, err := vc.Translate()
+	cfg, err := config.ParseConfig([]byte(config.DefaultConfig))
 	if err != nil {
 		return nil, err
 	}
 	return NewDetector(cfg), nil
+}
+
+// newScanDetector creates a private detector for one scan. It snapshots the
+// configuration and all mutable detector settings so changes made after the
+// scan starts cannot affect any file in that scan.
+func (d *Detector) newScanDetector() *Detector {
+	cfg := d.Config.Snapshot()
+	return &Detector{
+		Config:              cfg,
+		ConfigVersion:       cfg.Version,
+		ConfigPath:          cfg.Path,
+		Redact:              d.Redact,
+		Verbose:             d.Verbose,
+		MaxDecodeDepth:      d.MaxDecodeDepth,
+		MaxArchiveDepth:     d.MaxArchiveDepth,
+		MaxTargetMegaBytes:  d.MaxTargetMegaBytes,
+		FollowSymlinks:      d.FollowSymlinks,
+		NoColor:             d.NoColor,
+		IgnoreGitleaksAllow: d.IgnoreGitleaksAllow,
+		commitMutex:         &sync.Mutex{},
+		commitMap:           make(map[string]bool),
+		findingMutex:        &sync.Mutex{},
+		findings:            make([]report.Finding, 0),
+		prefilter:           *ahocorasick.NewTrieBuilder().AddStrings(maps.Keys(cfg.Keywords)).Build(),
+		baseline:            append([]report.Finding(nil), d.baseline...),
+		baselinePath:        d.baselinePath,
+		gitleaksIgnore:      maps.Clone(d.gitleaksIgnore),
+		Sema:                semgroup.NewGroup(context.Background(), 40),
+		scanMutex:           &sync.Mutex{},
+	}
+}
+
+func maybeSetSourceConfig(source sources.Source, cfg *config.Config) {
+	type configurableSource interface {
+		SetConfig(*config.Config)
+	}
+	if configurable, ok := source.(configurableSource); ok {
+		configurable.SetConfig(cfg)
+	}
+}
+
+func scanSource(source sources.Source) string {
+	switch source := source.(type) {
+	case *sources.Files:
+		return source.Path
+	case *sources.File:
+		if source.Path == "" {
+			return "stdin"
+		}
+		return source.Path
+	case *sources.Git:
+		if source.Cmd != nil {
+			return source.Cmd.RepoPath()
+		}
+		return "git"
+	default:
+		return fmt.Sprintf("%T", source)
+	}
 }
 
 func (d *Detector) AddGitleaksIgnore(gitleaksIgnorePath string) error {
@@ -206,6 +278,24 @@ func (d *Detector) DetectString(content string) []report.Finding {
 
 // DetectSource scans the given source and returns a list of findings
 func (d *Detector) DetectSource(ctx context.Context, source sources.Source) ([]report.Finding, error) {
+	if d.scanMutex == nil {
+		d.scanMutex = &sync.Mutex{}
+	}
+	d.scanMutex.Lock()
+	defer d.scanMutex.Unlock()
+
+	// Admit the scan with one immutable copy of the complete effective
+	// configuration. Every fragment, including fragments scanned by another
+	// goroutine, uses this same snapshot.
+	scan := d.newScanDetector()
+	scan.ConfigGeneration = d.generation.Add(1)
+	scan.ScanSource = scanSource(source)
+	maybeSetSourceConfig(source, &scan.Config)
+
+	// A retry starts a new transaction; never carry findings from an earlier
+	// attempt into this one.
+	d.setFindings(nil)
+
 	err := source.Fragments(ctx, func(fragment sources.Fragment, err error) error {
 		logContext := logging.With()
 
@@ -215,10 +305,10 @@ func (d *Detector) DetectSource(ctx context.Context, source sources.Source) ([]r
 
 		if len(fragment.CommitSHA) > 6 {
 			logContext = logContext.Str("commit", fragment.CommitSHA[:7])
-			d.addCommit(fragment.CommitSHA)
+			scan.addCommit(fragment.CommitSHA)
 		} else if len(fragment.CommitSHA) > 0 {
 			logContext = logContext.Str("commit", fragment.CommitSHA)
-			d.addCommit(fragment.CommitSHA)
+			scan.addCommit(fragment.CommitSHA)
 			logger := logContext.Logger()
 			logger.Warn().Msg("commit SHAs should be >= 7 characters long")
 		}
@@ -246,8 +336,8 @@ func (d *Detector) DetectSource(ctx context.Context, source sources.Source) ([]r
 			})
 		}
 
-		for _, finding := range d.DetectContext(ctx, Fragment(fragment)) {
-			d.AddFinding(finding)
+		for _, finding := range scan.detectContext(ctx, Fragment(fragment)) {
+			scan.AddFinding(finding)
 		}
 
 		// Stop the timer if it was created
@@ -259,11 +349,26 @@ func (d *Detector) DetectSource(ctx context.Context, source sources.Source) ([]r
 	})
 
 	if _, isGit := source.(*sources.Git); isGit {
-		logging.Info().Msgf("%d commits scanned.", len(d.commitMap))
+		logging.Info().Msgf("%d commits scanned.", len(scan.commitMap))
 		logging.Debug().Msg("Note: this number might be smaller than expected due to commits with no additions")
 	}
 
-	return d.Findings(), err
+	d.TotalBytes.Add(scan.TotalBytes.Load())
+	d.ConfigVersion = scan.ConfigVersion
+	d.ConfigPath = scan.ConfigPath
+	d.ScanSource = scan.ScanSource
+	d.ConfigGeneration = scan.ConfigGeneration
+	d.Config.Version = scan.ConfigVersion
+
+	if err != nil {
+		// Never publish a partial scan as the detector's completed result.
+		d.setFindings(nil)
+		return nil, err
+	}
+
+	findings := scan.Findings()
+	d.setFindings(d.ReportFindings(findings))
+	return findings, nil
 }
 
 // Detect scans the given fragment and returns a list of findings
@@ -274,6 +379,14 @@ func (d *Detector) Detect(fragment Fragment) []report.Finding {
 // DetectContext is the same as Detect but supports passing in a
 // context to use for timeouts
 func (d *Detector) DetectContext(ctx context.Context, fragment Fragment) []report.Finding {
+	scan := d.newScanDetector()
+	scan.ConfigGeneration = d.generation.Add(1)
+	findings := scan.detectContext(ctx, fragment)
+	d.TotalBytes.Add(scan.TotalBytes.Load())
+	return findings
+}
+
+func (d *Detector) detectContext(ctx context.Context, fragment Fragment) []report.Finding {
 	if fragment.Bytes == nil {
 		d.TotalBytes.Add(uint64(len(fragment.Raw)))
 	}
@@ -709,6 +822,9 @@ func abs(x int) int {
 
 // AddFinding synchronously adds a finding to the findings slice
 func (d *Detector) AddFinding(finding report.Finding) {
+	if d.findingMutex == nil {
+		d.findingMutex = &sync.Mutex{}
+	}
 	globalFingerprint := fmt.Sprintf("%s:%s:%d", finding.File, finding.RuleID, finding.StartLine)
 	if finding.Commit != "" {
 		finding.Fingerprint = fmt.Sprintf("%s:%s:%s:%d", finding.Commit, finding.File, finding.RuleID, finding.StartLine)
@@ -750,7 +866,45 @@ func (d *Detector) AddFinding(finding report.Finding) {
 
 // Findings returns the findings added to the detector
 func (d *Detector) Findings() []report.Finding {
-	return d.findings
+	if d.findingMutex == nil {
+		d.findingMutex = &sync.Mutex{}
+	}
+	d.findingMutex.Lock()
+	defer d.findingMutex.Unlock()
+	return append([]report.Finding(nil), d.findings...)
+}
+
+func (d *Detector) setFindings(findings []report.Finding) {
+	if d.findingMutex == nil {
+		d.findingMutex = &sync.Mutex{}
+	}
+	d.findingMutex.Lock()
+	d.findings = append([]report.Finding(nil), findings...)
+	d.findingMutex.Unlock()
+}
+
+// ScanMetadata returns the identity of the configuration generation used by
+// the most recently admitted scan.
+func (d *Detector) ScanMetadata() report.ScanMetadata {
+	return report.ScanMetadata{
+		ConfigVersion:    d.ConfigVersion,
+		ConfigPath:       d.ConfigPath,
+		ScanSource:       d.ScanSource,
+		ConfigGeneration: d.ConfigGeneration,
+	}
+}
+
+// ReportFindings returns a copy of findings with the scan's configuration
+// identity attached. Detection results themselves intentionally stay
+// compatible with callers that compare report.Finding values directly.
+func (d *Detector) ReportFindings(findings []report.Finding) []report.Finding {
+	metadata := d.ScanMetadata()
+	out := make([]report.Finding, len(findings))
+	for i, finding := range findings {
+		metadata.Apply(&finding)
+		out[i] = finding
+	}
+	return out
 }
 
 // AddCommit synchronously adds a commit to the commit slice

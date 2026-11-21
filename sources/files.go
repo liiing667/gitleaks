@@ -35,7 +35,7 @@ func DirectoryTargets(sourcePath string, s *semgroup.Group, followSymlinks bool,
 
 	s.Go(func() error {
 		ctx := context.Background()
-		err := files.scanTargets(ctx, func(scanTarget ScanTarget, err error) error {
+		err := files.scanTargets(ctx, snapshotConfig(files.Config), func(scanTarget ScanTarget, err error) error {
 			paths <- scanTarget
 			return nil
 		})
@@ -56,8 +56,13 @@ type Files struct {
 	MaxArchiveDepth int
 }
 
+// SetConfig replaces the configuration used for path allowlists.
+func (s *Files) SetConfig(cfg *config.Config) {
+	s.Config = cfg
+}
+
 // scanTargets yields scan targets to a callback func
-func (s *Files) scanTargets(ctx context.Context, yield func(ScanTarget, error) error) error {
+func (s *Files) scanTargets(ctx context.Context, cfg *config.Config, yield func(ScanTarget, error) error) error {
 	return filepath.WalkDir(s.Path, func(path string, d fs.DirEntry, err error) error {
 		scanTarget := ScanTarget{Path: path}
 		logger := logging.With().Str("path", path).Logger()
@@ -122,14 +127,14 @@ func (s *Files) scanTargets(ctx context.Context, yield func(ScanTarget, error) e
 
 		// handle dir cases (mainly just see if it should be skipped
 		if info.IsDir() {
-			if shouldSkipPath(s.Config, path) {
+			if shouldSkipPath(cfg, path) {
 				logger.Debug().Msg("skipping directory: global allowlist")
 				return filepath.SkipDir
 			}
 			return nil
 		}
 
-		if shouldSkipPath(s.Config, path) {
+		if shouldSkipPath(cfg, path) {
 			logger.Debug().Msg("skipping file: global allowlist")
 			return nil
 		}
@@ -141,8 +146,9 @@ func (s *Files) scanTargets(ctx context.Context, yield func(ScanTarget, error) e
 // Fragments yields fragments from files discovered under the path
 func (s *Files) Fragments(ctx context.Context, yield FragmentsFunc) error {
 	var wg sync.WaitGroup
+	cfg := snapshotConfig(s.Config)
 
-	err := s.scanTargets(ctx, func(scanTarget ScanTarget, err error) error {
+	err := s.scanTargets(ctx, cfg, func(scanTarget ScanTarget, err error) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -166,7 +172,7 @@ func (s *Files) Fragments(ctx context.Context, yield FragmentsFunc) error {
 					Content:         f,
 					Path:            scanTarget.Path,
 					Symlink:         scanTarget.Symlink,
-					Config:          s.Config,
+					Config:          cfg,
 					MaxArchiveDepth: s.MaxArchiveDepth,
 				}
 
