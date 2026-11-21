@@ -137,6 +137,10 @@ func shannonEntropy(data string) (entropy float64) {
 func filter(findings []report.Finding, redact uint) []report.Finding {
 	var retFindings []report.Finding
 	for _, f := range findings {
+		if f.Fingerprint == "" {
+			f.Fingerprint = findingFingerprint(f)
+		}
+
 		include := true
 		if strings.Contains(strings.ToLower(f.RuleID), "generic") {
 			for _, fPrime := range findings {
@@ -146,9 +150,7 @@ func filter(findings []report.Finding, redact uint) []report.Finding {
 					strings.Contains(fPrime.Secret, f.Secret) &&
 					!strings.Contains(strings.ToLower(fPrime.RuleID), "generic") {
 
-					genericMatch := strings.ReplaceAll(f.Match, f.Secret, "REDACTED")
-					betterMatch := strings.ReplaceAll(fPrime.Match, fPrime.Secret, "REDACTED")
-					logging.Trace().Msgf("skipping %s finding (%s), %s rule takes precedence (%s)", f.RuleID, genericMatch, fPrime.RuleID, betterMatch)
+					logging.Trace().Msgf("skipping %s finding, %s rule takes precedence", f.RuleID, fPrime.RuleID)
 					include = false
 					break
 				}
@@ -163,6 +165,13 @@ func filter(findings []report.Finding, redact uint) []report.Finding {
 		}
 	}
 	return retFindings
+}
+
+func findingFingerprint(f report.Finding) string {
+	if f.Commit != "" {
+		return fmt.Sprintf("%s:%s:%s:%d", f.Commit, f.File, f.RuleID, f.StartLine)
+	}
+	return fmt.Sprintf("%s:%s:%d", f.File, f.RuleID, f.StartLine)
 }
 
 func printFinding(f report.Finding, noColor bool) {

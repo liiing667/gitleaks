@@ -93,11 +93,11 @@ func (d *Decoder) findEncodedSegments(data string, predecessors []*EncodedSegmen
 		logging.Debug().
 			Str("decoder", m.encoding.kind.String()).
 			Msgf(
-				"segment found: original=%s pos=%s: %q -> %q",
+				"segment found: original=%s pos=%s encoded-bytes=%d decoded-bytes=%d",
 				segment.original,
 				segment.encoded,
-				encodedValue,
-				segment.decodedValue,
+				len(encodedValue),
+				len(segment.decodedValue),
 			)
 	}
 

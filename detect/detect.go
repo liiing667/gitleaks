@@ -206,6 +206,10 @@ func (d *Detector) DetectString(content string) []report.Finding {
 
 // DetectSource scans the given source and returns a list of findings
 func (d *Detector) DetectSource(ctx context.Context, source sources.Source) ([]report.Finding, error) {
+	// A detector instance can be reused for retries. Findings from an earlier
+	// attempt must never leak into the report of the current attempt.
+	d.resetFindings()
+
 	err := source.Fragments(ctx, func(fragment sources.Fragment, err error) error {
 		logContext := logging.With()
 
@@ -509,7 +513,7 @@ func (d *Detector) detectRule(fragment Fragment, currentRaw string, r config.Rul
 		}
 		if !d.IgnoreGitleaksAllow && strings.Contains(finding.Line, gitleaksAllowSignature) {
 			logger.Trace().
-				Str("finding", finding.Secret).
+				Str("finding-hash", report.HashSecret(finding.Secret)).
 				Msg("skipping finding: 'gitleaks:allow' signature")
 			continue
 		}
@@ -546,7 +550,7 @@ func (d *Detector) detectRule(fragment Fragment, currentRaw string, r config.Rul
 			// entropy is too low, skip this finding
 			if entropy <= r.Entropy {
 				logger.Trace().
-					Str("finding", finding.Secret).
+					Str("finding-hash", report.HashSecret(finding.Secret)).
 					Float32("entropy", finding.Entropy).
 					Msg("skipping finding: low entropy")
 				continue
@@ -709,15 +713,22 @@ func abs(x int) int {
 
 // AddFinding synchronously adds a finding to the findings slice
 func (d *Detector) AddFinding(finding report.Finding) {
-	globalFingerprint := fmt.Sprintf("%s:%s:%d", finding.File, finding.RuleID, finding.StartLine)
-	if finding.Commit != "" {
-		finding.Fingerprint = fmt.Sprintf("%s:%s:%s:%d", finding.Commit, finding.File, finding.RuleID, finding.StartLine)
-	} else {
-		finding.Fingerprint = globalFingerprint
+	if d.findingMutex == nil {
+		d.findingMutex = &sync.Mutex{}
 	}
 
+	// The default scan path redacts in filter(), but AddFinding is public.
+	// Redact here as well so a library caller cannot accidentally publish a
+	// plaintext finding while the detector is configured to redact.
+	if d.Redact > 0 {
+		finding.Redact(d.Redact)
+	}
+
+	globalFingerprint := fmt.Sprintf("%s:%s:%d", finding.File, finding.RuleID, finding.StartLine)
+	finding.Fingerprint = findingFingerprint(finding)
+
 	// check if we should ignore this finding
-	logger := logging.With().Str("finding", finding.Secret).Logger()
+	logger := logging.With().Str("fingerprint", finding.Fingerprint).Logger()
 	if _, ok := d.gitleaksIgnore[globalFingerprint]; ok {
 		logger.Debug().
 			Str("fingerprint", globalFingerprint).
@@ -751,6 +762,16 @@ func (d *Detector) AddFinding(finding report.Finding) {
 // Findings returns the findings added to the detector
 func (d *Detector) Findings() []report.Finding {
 	return d.findings
+}
+
+func (d *Detector) resetFindings() {
+	if d.findingMutex == nil {
+		d.findings = make([]report.Finding, 0)
+		return
+	}
+	d.findingMutex.Lock()
+	d.findings = make([]report.Finding, 0)
+	d.findingMutex.Unlock()
 }
 
 // AddCommit synchronously adds a commit to the commit slice
@@ -843,8 +864,8 @@ func checkFindingAllowed(
 			commit                 string
 			pathAllowed            bool
 			regexAllowed           = a.RegexAllowed(allowlistTarget)
-			containsStopword, word = a.ContainsStopWord(finding.Secret)
 		)
+		containsStopword, _ := a.ContainsStopWord(finding.Secret)
 		// If the condition is "AND" we need to check all conditions.
 		if a.MatchCondition == config.AllowlistMatchAnd {
 			// Determine applicable checks.
@@ -869,9 +890,10 @@ func checkFindingAllowed(
 		}
 
 		if isAllowed {
-			event := logger.Trace().
-				Str("finding", finding.Secret).
-				Str("condition", a.MatchCondition.String())
+			event := logger.Trace().Str("condition", a.MatchCondition.String())
+			if hash := report.HashSecret(finding.Secret); hash != "" {
+				event = event.Str("finding-hash", hash)
+			}
 			if commitAllowed {
 				event.Str("allowed-commit", commit)
 			}
@@ -882,7 +904,7 @@ func checkFindingAllowed(
 				event.Bool("allowed-regex", regexAllowed)
 			}
 			if containsStopword {
-				event.Str("allowed-stopword", word)
+				event.Bool("allowed-stopword", containsStopword)
 			}
 			return true, event
 		}

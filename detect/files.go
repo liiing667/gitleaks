@@ -15,6 +15,9 @@ import (
 //
 // Deprecated: Use sources.Files and Detector.DetectSource instead
 func (d *Detector) DetectFiles(scanTargets <-chan sources.ScanTarget) ([]report.Finding, error) {
+	// Retrying with the same detector starts a new result set.
+	d.resetFindings()
+
 	var wg sync.WaitGroup
 
 	for scanTarget := range scanTargets {

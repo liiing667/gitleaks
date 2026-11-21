@@ -1,6 +1,8 @@
 package report
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"math"
 	"strings"
@@ -28,6 +30,15 @@ type Finding struct {
 	// Captured secret
 	Secret string
 
+	// SecretHash is a stable, non-reversible identity for the unredacted
+	// secret. It is populated when a finding is redacted so that a redacted
+	// baseline can still distinguish the original value from a rotated value.
+	SecretHash string `json:",omitempty"`
+
+	// RedactionSource records that Secret, Match, and Line were produced by
+	// gitleaks redaction. It is intentionally empty for unredacted findings.
+	RedactionSource string `json:",omitempty"`
+
 	// File is the name of the file containing the finding
 	File        string
 	SymlinkFile string
@@ -54,6 +65,11 @@ type Finding struct {
 	requiredFindings []*RequiredFinding
 }
 
+const (
+	// RedactionSourceRedact identifies the built-in --redact path.
+	RedactionSourceRedact = "redact"
+)
+
 type RequiredFinding struct {
 	// contains a subset of the Finding fields
 	// only used for reporting
@@ -76,13 +92,112 @@ func (f *Finding) AddRequiredFindings(afs []*RequiredFinding) {
 
 // Redact removes sensitive information from a finding.
 func (f *Finding) Redact(percent uint) {
+	if percent == 0 || f == nil {
+		return
+	}
+
+	// Redaction is one-way. Avoid re-masking an already redacted finding:
+	// serializing the same finding again (or loading and re-emitting a
+	// baseline) must not truncate the value a second time.
+	if f.RedactionSource != "" {
+		if percent >= 100 && f.Secret != "" && f.Secret != "REDACTED" {
+			f.Line = replaceSecret(f.Line, f.Secret, "REDACTED")
+			f.Match = replaceSecret(f.Match, f.Secret, "REDACTED")
+			if f.Fragment != nil {
+				f.Fragment.Raw = replaceSecret(f.Fragment.Raw, f.Secret, "REDACTED")
+				if len(f.Fragment.Bytes) > 0 {
+					f.Fragment.Bytes = []byte(replaceSecret(string(f.Fragment.Bytes), f.Secret, "REDACTED"))
+				}
+			}
+			f.Secret = "REDACTED"
+			for _, aux := range f.requiredFindings {
+				if aux == nil || aux.Secret == "" {
+					continue
+				}
+				aux.Line = replaceSecret(aux.Line, aux.Secret, "REDACTED")
+				aux.Match = replaceSecret(aux.Match, aux.Secret, "REDACTED")
+				aux.Secret = "REDACTED"
+			}
+		}
+		return
+	}
+
+	rawSecret := f.Secret
+	if rawSecret != "" && f.SecretHash == "" && !IsRedactedValue(rawSecret) {
+		f.SecretHash = HashSecret(rawSecret)
+	}
+
 	secret := maskSecret(f.Secret, percent)
 	if percent >= 100 {
 		secret = "REDACTED"
 	}
-	f.Line = strings.ReplaceAll(f.Line, f.Secret, secret)
-	f.Match = strings.ReplaceAll(f.Match, f.Secret, secret)
+	if rawSecret != "" {
+		f.Line = replaceSecret(f.Line, rawSecret, secret)
+		f.Match = replaceSecret(f.Match, rawSecret, secret)
+		if f.Fragment != nil {
+			f.Fragment.Raw = replaceSecret(f.Fragment.Raw, rawSecret, secret)
+			if len(f.Fragment.Bytes) > 0 {
+				f.Fragment.Bytes = []byte(replaceSecret(string(f.Fragment.Bytes), rawSecret, secret))
+			}
+		}
+	}
 	f.Secret = secret
+
+	redacted := rawSecret != ""
+	for _, aux := range f.requiredFindings {
+		if aux == nil || aux.Secret == "" {
+			continue
+		}
+		auxSecret := maskSecret(aux.Secret, percent)
+		if percent >= 100 {
+			auxSecret = "REDACTED"
+		}
+		aux.Line = replaceSecret(aux.Line, aux.Secret, auxSecret)
+		aux.Match = replaceSecret(aux.Match, aux.Secret, auxSecret)
+		aux.Secret = auxSecret
+		redacted = true
+	}
+
+	if redacted {
+		f.RedactionSource = RedactionSourceRedact
+	}
+}
+
+func replaceSecret(value, secret, redacted string) string {
+	if value == "" || secret == "" {
+		return value
+	}
+	return strings.ReplaceAll(value, secret, redacted)
+}
+
+// HashSecret returns the SHA-256 hex digest of a secret. The digest is stable
+// across processes and hosts, which lets redacted findings and baselines use it
+// as an identity without persisting the plaintext value.
+//
+// The optional match argument produces a context-bound digest for callers that
+// need to distinguish identical secrets in different contexts. Findings use
+// the plain secret digest so rule and match formatting changes do not change
+// their identity.
+func HashSecret(secret string, match ...string) string {
+	if secret == "" {
+		return ""
+	}
+
+	hasher := sha256.New()
+	_, _ = hasher.Write([]byte(secret))
+	if len(match) > 0 {
+		_, _ = hasher.Write([]byte{0})
+		_, _ = hasher.Write([]byte(match[0]))
+	}
+	return hex.EncodeToString(hasher.Sum(nil))
+}
+
+// IsRedactedValue reports whether a persisted value was produced by a
+// gitleaks redaction mode, including legacy asterisk masks.
+func IsRedactedValue(value string) bool {
+	return value == "REDACTED" ||
+		strings.HasSuffix(value, "...") ||
+		(value != "" && strings.Trim(value, "*") == "")
 }
 
 func maskSecret(secret string, percent uint) string {
