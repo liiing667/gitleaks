@@ -21,6 +21,14 @@ import (
 const defaultBufferSize = 100 * 1_000 // 100kb
 const InnerPathSeparator = "!"
 
+// memberFragment pairs a fragment produced by an archive member with the
+// error it was yielded with, so both can be replayed downstream once the
+// member has been completely covered.
+type memberFragment struct {
+	fragment Fragment
+	err      error
+}
+
 type seekReaderAt interface {
 	io.ReaderAt
 	io.Seeker
@@ -138,8 +146,26 @@ func (s *File) extractorFragments(ctx context.Context, extractor archives.Extrac
 			archiveDepth:    s.archiveDepth + 1,
 		}
 
-		if err := file.Fragments(ctx, yield); err != nil {
+		// Buffer the member's fragments instead of streaming them straight
+		// downstream. The buffered fragments are only published once the
+		// member has been read to completion: if the scan is interrupted
+		// halfway through a member, the member's partial fragments are
+		// dropped and a single scan only exposes members it has completely
+		// covered. Because nested archives are handled by recursive calls
+		// through this same function, an outer member is only published
+		// once every member inside it has been completely covered as well.
+		var covered []memberFragment
+		if err := file.Fragments(ctx, func(fragment Fragment, err error) error {
+			covered = append(covered, memberFragment{fragment: fragment, err: err})
+			return nil
+		}); err != nil {
 			return err
+		}
+
+		for _, mf := range covered {
+			if err := yield(mf.fragment, mf.err); err != nil {
+				return err
+			}
 		}
 
 		return nil

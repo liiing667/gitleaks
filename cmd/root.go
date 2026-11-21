@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -462,30 +461,12 @@ func findingSummaryAndExit(detector *detect.Detector, findings []report.Finding,
 
 	// write report if desired
 	if detector.Reporter != nil {
-		var (
-			file      io.WriteCloser
-			reportErr error
-		)
-
-		if detector.ReportPath == report.StdoutReportPath {
-			file = os.Stdout
-		} else {
-			// Open the file.
-			if file, reportErr = os.Create(detector.ReportPath); reportErr != nil {
-				goto ReportEnd
-			}
-			defer func() {
-				_ = file.Close()
-			}()
-		}
-
-		// Write to the file.
-		if reportErr = detector.Reporter.Write(file, findings); reportErr != nil {
-			goto ReportEnd
-		}
-
-	ReportEnd:
-		if reportErr != nil {
+		if err != nil {
+			// The scan did not run to completion. Withhold the report so
+			// the partial results cannot be mistaken for complete coverage
+			// evidence (e.g. as a baseline) by a later run.
+			logging.Warn().Msg("scan did not complete; skipping report so partial results cannot be mistaken for complete coverage")
+		} else if reportErr := report.WriteFile(detector.ReportPath, detector.Reporter, findings); reportErr != nil {
 			logging.Fatal().Err(reportErr).Msg("failed to write report")
 		}
 	}

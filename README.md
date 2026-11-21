@@ -543,6 +543,13 @@ sets the potential to go that deep. It will only go as deep as it needs to.
 The findings for secrets located within an archive will include the path to the
 file inside the archive. Inner paths are separated with `!`.
 
+Archive members are only reported once they have been scanned to completion:
+if a scan is interrupted halfway through a member, that member contributes no
+findings at all. Likewise, the report at the fixed `--report-path` is written
+atomically and only once the scan has completed, so an interrupted scan never
+leaves behind a partial report (or any other marker) that a later run could
+mistake for complete coverage, e.g. as a `--baseline-path`.
+
 Example finding (shortened for brevity):
 
 ```
