@@ -753,6 +753,26 @@ func (d *Detector) Findings() []report.Finding {
 	return d.findings
 }
 
+// WriteReport writes the findings to the detector's configured report
+// destination (Detector.ReportPath) using the detector's Reporter.
+//
+// Reports written to a file are written atomically: the report is first
+// written to a temporary file and then renamed into place, so a failed write
+// returns an error and never leaves a partial report behind or clobbers a
+// previous one. This keeps the report on disk consistent with the findings
+// (and exit code) of the scan that produced it.
+func (d *Detector) WriteReport(findings []report.Finding) error {
+	if d.Reporter == nil {
+		return nil
+	}
+
+	if d.ReportPath == report.StdoutReportPath {
+		return d.Reporter.Write(os.Stdout, findings)
+	}
+
+	return report.WriteFile(d.ReportPath, d.Reporter, findings)
+}
+
 // AddCommit synchronously adds a commit to the commit slice
 func (d *Detector) addCommit(commit string) {
 	d.commitMutex.Lock()
