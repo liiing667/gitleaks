@@ -26,13 +26,24 @@ func (d *Detector) DetectFiles(scanTargets <-chan sources.ScanTarget) ([]report.
 			logger := logging.With().Str("path", scanTarget.Path).Logger()
 			logger.Trace().Msg("scanning path")
 
-			f, err := os.Open(scanTarget.Path)
-			if err != nil {
-				if os.IsPermission(err) {
-					err = errors.New("permission denied")
-				}
+			if !sources.WithinRoot(scanTarget.Root, scanTarget.Path) {
+				logger.Warn().
+					Str("root", scanTarget.Root).
+					Str("stage", "source_admission").
+					Msg("skipping file: outside controlled root")
+				return nil
+			}
 
-				logger.Warn().Err(err).Msg("skipping file")
+			f, err := sources.OpenControlled(scanTarget.Root, scanTarget.Path)
+			if err != nil {
+				if errors.Is(err, sources.ErrPathOutsideRoot) {
+					logger.Warn().Msg("skipping file: outside controlled root")
+				} else if os.IsPermission(err) {
+					err = errors.New("permission denied")
+					logger.Warn().Err(err).Msg("skipping file")
+				} else {
+					logger.Warn().Err(err).Msg("skipping file")
+				}
 				return nil
 			}
 			defer func() {
@@ -68,6 +79,7 @@ func (d *Detector) DetectFiles(scanTargets <-chan sources.ScanTarget) ([]report.
 				Content:         f,
 				Path:            scanTarget.Path,
 				Symlink:         scanTarget.Symlink,
+				Root:            scanTarget.Root,
 				Config:          &d.Config,
 				MaxArchiveDepth: d.MaxArchiveDepth,
 			}

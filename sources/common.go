@@ -4,9 +4,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"io"
+	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	"github.com/mholt/archives"
 	"github.com/zricethezav/gitleaks/v8/config"
@@ -17,12 +20,187 @@ const maxPeekSize = 25 * 1_000 // 10kb
 var isWhitespace [256]bool
 var isWindows = runtime.GOOS == "windows"
 
+// ErrPathOutsideRoot is returned when a source path resolves outside the
+// controlled scan root that was frozen when the source was discovered.
+var ErrPathOutsideRoot = errors.New("path resolves outside the controlled root")
+
 func init() {
 	// define whitespace characters
 	isWhitespace[' '] = true
 	isWhitespace['\t'] = true
 	isWhitespace['\n'] = true
 	isWhitespace['\r'] = true
+}
+
+// WithinRoot reports whether candidate is inside root. It first compares
+// cleaned absolute paths and, when that fails, compares resolved paths so a
+// symlinked ancestor does not split one logical root into two identities.
+// Callers that admit filesystem objects must still resolve the candidate
+// immediately before opening it (see OpenControlled).
+func WithinRoot(root, candidate string) bool {
+	if root == "" {
+		return true
+	}
+	if candidate == "" {
+		return false
+	}
+
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return false
+	}
+	absCandidate, err := filepath.Abs(candidate)
+	if err != nil {
+		return false
+	}
+
+	if withinLexicalRoot(absRoot, absCandidate) {
+		return true
+	}
+
+	// A source path may itself contain a symlinked directory (for example a
+	// temp directory under /var on some platforms). Fall back to comparing
+	// resolved paths before rejecting the candidate.
+	resolvedRoot, err := filepath.EvalSymlinks(absRoot)
+	if err != nil {
+		return false
+	}
+	resolvedCandidate, err := filepath.EvalSymlinks(absCandidate)
+	if err != nil {
+		return false
+	}
+	return withinLexicalRoot(resolvedRoot, resolvedCandidate)
+}
+
+func withinLexicalRoot(absRoot, absCandidate string) bool {
+	rel, err := filepath.Rel(absRoot, absCandidate)
+	if err != nil || filepath.IsAbs(rel) {
+		return false
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+
+	return true
+}
+
+// logicalFileWithinRoot is like WithinRoot but treats a non-existent relative
+// path as a logical path rooted at root. This keeps in-memory sources (which
+// provide Content directly) usable while still rejecting real paths outside
+// the controlled root.
+func logicalFileWithinRoot(root, path string) bool {
+	if root == "" || path == "" {
+		return true
+	}
+	if WithinRoot(root, path) {
+		return true
+	}
+	if filepath.IsAbs(path) {
+		return false
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		return false
+	}
+	return WithinRoot(root, filepath.Join(root, path))
+}
+
+// controlledRootFor freezes a containment root for a discovered source. When
+// the source is inside a git worktree, the worktree root is used so existing
+// repository-relative links keep working. Otherwise the source directory is
+// the root. A source outside any worktree cannot pull a sibling directory into
+// the scan through a link.
+func controlledRootFor(sourcePath string) string {
+	absSource, err := filepath.Abs(sourcePath)
+	if err != nil {
+		absSource = filepath.Clean(sourcePath)
+	}
+	if resolved, err := filepath.EvalSymlinks(absSource); err == nil {
+		absSource = resolved
+	}
+
+	if info, err := os.Stat(absSource); err == nil && info.IsDir() {
+		if root := findGitRoot(absSource); root != "" {
+			return root
+		}
+		return absSource
+	}
+
+	if root := findGitRoot(absSource); root != "" {
+		return root
+	}
+	return filepath.Dir(absSource)
+}
+
+func findGitRoot(absPath string) string {
+	dir := absPath
+	if info, err := os.Stat(dir); err == nil && !info.IsDir() {
+		dir = filepath.Dir(dir)
+	}
+
+	for {
+		if isGitWorktree(dir) {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return ""
+		}
+		dir = parent
+	}
+}
+
+// isGitWorktree distinguishes a real worktree from an empty or stale ".git"
+// directory. This prevents an unrelated parent directory from widening the
+// controlled root for temp-directory scans.
+func isGitWorktree(dir string) bool {
+	gitPath := filepath.Join(dir, ".git")
+	info, err := os.Stat(gitPath)
+	if err != nil {
+		return false
+	}
+	if info.IsDir() {
+		_, err := os.Stat(filepath.Join(gitPath, "HEAD"))
+		return err == nil
+	}
+
+	data, err := os.ReadFile(gitPath)
+	if err != nil {
+		return false
+	}
+	const prefix = "gitdir:"
+	line := strings.TrimSpace(string(data))
+	if len(line) < len(prefix) || !strings.EqualFold(line[:len(prefix)], prefix) {
+		return false
+	}
+	target := strings.TrimSpace(line[len(prefix):])
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(dir, target)
+	}
+	_, err = os.Stat(target)
+	return err == nil
+}
+
+// OpenControlled opens path only after resolving symlinks and checking that
+// the resolved target is still inside root. It keeps the "quarantine before
+// read" boundary for both source discovery and later consumers.
+func OpenControlled(root, path string) (*os.File, error) {
+	if root != "" {
+		if absRoot, err := filepath.Abs(root); err == nil {
+			root = absRoot
+		}
+		if resolvedRoot, err := filepath.EvalSymlinks(root); err == nil {
+			root = resolvedRoot
+		}
+		resolved, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			return nil, err
+		}
+		if !WithinRoot(root, resolved) {
+			return nil, ErrPathOutsideRoot
+		}
+	}
+
+	return os.Open(path)
 }
 
 // isArchive does a light check to see if the provided path is an archive or

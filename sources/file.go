@@ -22,6 +22,7 @@ const defaultBufferSize = 100 * 1_000 // 100kb
 const InnerPathSeparator = "!"
 
 type seekReaderAt interface {
+	io.Reader
 	io.ReaderAt
 	io.Seeker
 }
@@ -30,10 +31,15 @@ type seekReaderAt interface {
 type File struct {
 	// Content provides a reader to the file's content
 	Content io.Reader
-	// Path is the resolved real path of the file
+	// Path is the logical path of the file. For archive members it is the
+	// sanitized path relative to the archive root, never a temporary path.
 	Path string
 	// Symlink represents a symlink to the file if that's how it was discovered
 	Symlink string
+	// Root is the controlled scan root frozen when the source was discovered.
+	// Archive members inherit it, and it is never replaced by a temporary
+	// extraction path.
+	Root string
 	// Buffer is used for reading the content in chunks
 	Buffer []byte
 	// Config is the gitleaks config used for shouldSkipPath. If not set, then
@@ -46,10 +52,39 @@ type File struct {
 	MaxArchiveDepth int
 	// archiveDepth is the current archive nesting depth
 	archiveDepth int
+	// link indicates Content is the declaration of an archive link rather
+	// than the target's bytes. Link declarations must never be interpreted as
+	// nested archives.
+	link bool
+	// chainValidated records that the parent already validated the frozen
+	// logical container chain before opening this member.
+	chainValidated bool
 }
 
 // Fragments yields fragments for the this source
 func (s *File) Fragments(ctx context.Context, yield FragmentsFunc) error {
+	if !s.withinControlledRoot() {
+		logging.Warn().
+			Str("path", s.FullPath()).
+			Str("root", s.Root).
+			Str("stage", "source_discovery").
+			Msg("skipping source: outside controlled root")
+		return nil
+	}
+	if len(s.outerPaths) > 0 && !s.chainValidated {
+		if err := s.validateArchiveContainer(); err != nil {
+			logging.Warn().
+				Str("path", s.FullPath()).
+				Str("stage", "archive_containment").
+				Str("reason", err.Error()).
+				Msg("skipping archive member: unsafe or ambiguous container path")
+			return nil
+		}
+	}
+	if s.link {
+		return s.fileFragments(ctx, bufio.NewReader(s.Content), yield)
+	}
+
 	format, _, err := archives.Identify(ctx, s.Path, nil)
 	// Process the file as an archive if there's no error && Identify returns
 	// a format; but if there's an error or no format, just swallow the error
@@ -74,6 +109,16 @@ func (s *File) Fragments(ctx context.Context, yield FragmentsFunc) error {
 
 			return nil
 		}
+		if len(s.outerPaths) == 0 {
+			if err := s.validateArchiveContainer(); err != nil {
+				logging.Warn().
+					Str("path", s.FullPath()).
+					Str("stage", "archive_containment").
+					Str("reason", err.Error()).
+					Msg("skipping archive: unsafe or ambiguous container path")
+				return nil
+			}
+		}
 		if extractor, ok := format.(archives.Extractor); ok {
 			return s.extractorFragments(ctx, extractor, s.Content, yield)
 		}
@@ -88,62 +133,224 @@ func (s *File) Fragments(ctx context.Context, yield FragmentsFunc) error {
 
 // extractorFragments recursively crawls archives and yields fragments
 func (s *File) extractorFragments(ctx context.Context, extractor archives.Extractor, reader io.Reader, yield FragmentsFunc) error {
-	if _, isSeekReaderAt := reader.(seekReaderAt); !isSeekReaderAt {
-		switch extractor.(type) {
-		case archives.SevenZip, archives.Zip:
-			tmpfile, err := os.CreateTemp("", "gitleaks-archive-")
-			if err != nil {
-				logging.Error().Str("path", s.FullPath()).Msg("could not create tmp file")
-				return nil
-			}
-			defer func() {
-				_ = tmpfile.Close()
-				_ = os.Remove(tmpfile.Name())
-			}()
+	// Archive inspection and extraction both operate on the same immutable,
+	// seekable reader. If the caller supplied a stream, spool it first. The
+	// temporary file is only a byte source: it never contributes to a
+	// member's logical identity or finding path.
+	archiveReader, cleanup, err := archiveReaderFor(reader)
+	if err != nil {
+		logging.Error().Err(err).Str("path", s.FullPath()).Msg("could not prepare archive reader")
+		return nil
+	}
+	defer cleanup()
 
-			_, err = io.Copy(tmpfile, reader)
-			if err != nil {
-				logging.Error().Str("path", s.FullPath()).Msg("could not copy archive file")
-				return nil
-			}
-
-			reader = tmpfile
-		}
+	plan, err := s.planArchive(ctx, extractor, archiveReader)
+	if err != nil {
+		logging.Error().Err(err).Str("path", s.FullPath()).Msg("could not inspect archive")
+		return err
+	}
+	if err := rewindArchiveReader(archiveReader); err != nil {
+		logging.Error().Err(err).Str("path", s.FullPath()).Msg("could not rewind archive reader")
+		return nil
 	}
 
-	return extractor.Extract(ctx, reader, func(_ context.Context, d archives.FileInfo) error {
+	outerPaths := s.outerPathsWithSelf()
+	return extractor.Extract(ctx, archiveReader, func(_ context.Context, d archives.FileInfo) error {
 		if d.IsDir() {
 			return nil
 		}
 
-		innerReader, err := d.Open()
+		// Validate the declared member identity and quarantine unsafe,
+		// ambiguous, or cyclic members before opening their content or
+		// applying path allowlists.
+		member, err := secureArchivePath(d.NameInArchive)
 		if err != nil {
-			logging.Error().Err(err).Str("path", s.FullPath()).Msg("could not open archive inner file")
+			s.logArchiveMemberSkipped(d.NameInArchive, err)
 			return nil
 		}
-		defer innerReader.Close()
-		path := filepath.Clean(d.NameInArchive)
-
-		if s.Config != nil && shouldSkipPath(s.Config, path) {
-			logging.Debug().Str("path", s.FullPath()).Msg("skipping file: global allowlist")
+		if reason, isolated := plan.isolatedReason(member); isolated {
+			s.logArchiveMemberSkipped(d.NameInArchive, reason)
 			return nil
+		}
+
+		if s.Config != nil && shouldSkipPath(s.Config, member) {
+			logging.Debug().
+				Str("path", s.FullPath()).
+				Str("archive_member", member).
+				Msg("skipping file: global allowlist")
+			return nil
+		}
+
+		if d.LinkTarget != "" {
+			target, err := secureArchiveLinkTarget(member, d.LinkTarget)
+			if err != nil {
+				s.logArchiveMemberSkipped(d.NameInArchive, err)
+				return nil
+			}
+			if reason, isolated := plan.isolatedReason(target); isolated {
+				s.logArchiveMemberSkipped(d.NameInArchive, reason)
+				return nil
+			}
+			if _, isDir := plan.dirs[target]; isDir {
+				s.logArchiveMemberSkipped(d.NameInArchive, errArchiveLinkDirectory)
+				return nil
+			}
+			if _, exists := plan.members[target]; !exists {
+				s.logArchiveMemberSkipped(d.NameInArchive, errArchiveLinkMissing)
+				return nil
+			}
+			if s.Config != nil && shouldSkipPath(s.Config, target) {
+				logging.Debug().
+					Str("path", s.FullPath()).
+					Str("archive_member", member).
+					Str("archive_link_target", target).
+					Msg("skipping file: global allowlist")
+				return nil
+			}
 		}
 
 		file := &File{
-			Content:         innerReader,
-			Path:            path,
+			Path:            member,
 			Symlink:         s.Symlink,
-			outerPaths:      append(s.outerPaths, filepath.ToSlash(s.Path)),
+			Root:            s.Root,
+			Config:          s.Config,
+			outerPaths:      outerPaths,
 			MaxArchiveDepth: s.MaxArchiveDepth,
 			archiveDepth:    s.archiveDepth + 1,
+			link:            d.LinkTarget != "",
+			// The parent validated its frozen chain and the member path was
+			// sanitized above, before any content is opened.
+			chainValidated: true,
 		}
 
-		if err := file.Fragments(ctx, yield); err != nil {
-			return err
+		innerReader, err := d.Open()
+		if err != nil {
+			logging.Error().
+				Err(err).
+				Str("path", s.FullPath()).
+				Str("archive_member", d.NameInArchive).
+				Msg("could not open archive inner file")
+			return nil
+		}
+		file.Content = innerReader
+
+		memberErr := file.Fragments(ctx, yield)
+		closeErr := innerReader.Close()
+		if memberErr != nil {
+			return memberErr
+		}
+		if closeErr != nil {
+			logging.Debug().
+				Err(closeErr).
+				Str("path", s.FullPath()).
+				Str("archive_member", d.NameInArchive).
+				Msg("could not close archive inner file")
 		}
 
 		return nil
 	})
+}
+
+// archiveReaderFor returns a seekable reader for an archive. A non-seekable
+// stream is spooled to a private temporary file and cleaned up by the returned
+// function. The temporary name is deliberately not exposed through File.Path
+// or FullPath.
+func archiveReaderFor(reader io.Reader) (seekReaderAt, func(), error) {
+	if seekable, ok := reader.(seekReaderAt); ok {
+		// A type can implement the interfaces while the underlying stream is
+		// not actually seekable. Verify before relying on a rewind.
+		if _, err := seekable.Seek(0, io.SeekCurrent); err == nil {
+			return seekable, func() {}, nil
+		}
+	}
+
+	tmpfile, err := os.CreateTemp("", "gitleaks-archive-")
+	if err != nil {
+		return nil, nil, err
+	}
+	cleanup := func() {
+		_ = tmpfile.Close()
+		_ = os.Remove(tmpfile.Name())
+	}
+
+	if _, err := io.Copy(tmpfile, reader); err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+	if _, err := tmpfile.Seek(0, io.SeekStart); err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+
+	return tmpfile, cleanup, nil
+}
+
+func rewindArchiveReader(reader seekReaderAt) error {
+	_, err := reader.Seek(0, io.SeekStart)
+	return err
+}
+
+// withinControlledRoot reports whether the File was discovered under Root.
+// Archive members are validated through their container chain instead.
+func (s *File) withinControlledRoot() bool {
+	if s.Root == "" || s.Path == "" || len(s.outerPaths) > 0 {
+		return true
+	}
+	if !logicalFileWithinRoot(s.Root, s.Path) {
+		return false
+	}
+	if resolved, err := filepath.EvalSymlinks(s.Path); err == nil && !WithinRoot(s.Root, resolved) {
+		return false
+	}
+	return true
+}
+
+// validateArchiveContainer ensures that a logical archive chain is
+// unambiguous and that the outermost container came from the controlled root.
+func (s *File) validateArchiveContainer() error {
+	parts := s.outerPathsWithSelf()
+	for i, part := range parts {
+		if strings.ContainsRune(part, 0) {
+			return errArchiveContainerNull
+		}
+		if strings.Contains(part, InnerPathSeparator) {
+			return errArchiveContainerSeparator
+		}
+		if i == 0 {
+			if s.Root != "" {
+				if !logicalFileWithinRoot(s.Root, part) {
+					return errArchiveContainerOutsideRoot
+				}
+				if resolved, err := filepath.EvalSymlinks(part); err == nil && !WithinRoot(s.Root, resolved) {
+					return errArchiveContainerOutsideRoot
+				}
+			}
+			continue
+		}
+		if _, err := secureArchivePath(part); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// outerPathsWithSelf returns a frozen copy of the logical container chain.
+// Copying also avoids slice aliasing between sibling archive members.
+func (s *File) outerPathsWithSelf() []string {
+	outerPaths := make([]string, len(s.outerPaths)+1)
+	copy(outerPaths, s.outerPaths)
+	outerPaths[len(s.outerPaths)] = filepath.ToSlash(s.Path)
+	return outerPaths
+}
+
+func (s *File) logArchiveMemberSkipped(rawName string, err error) {
+	logging.Warn().
+		Str("path", s.FullPath()).
+		Str("archive_member", rawName).
+		Str("stage", "archive_containment").
+		Str("reason", err.Error()).
+		Msg("skipping archive member: unsafe path")
 }
 
 // decompressorFragments recursively crawls archives and yields fragments
@@ -253,11 +460,11 @@ func (s *File) fileFragments(ctx context.Context, reader *bufio.Reader, yield Fr
 // FullPath returns the File.Path with any preceding outer paths
 func (s *File) FullPath() string {
 	if len(s.outerPaths) > 0 {
-		return strings.Join(
-			// outerPaths have already been normalized to slash
-			append(s.outerPaths, s.Path),
-			InnerPathSeparator,
-		)
+		parts := make([]string, len(s.outerPaths)+1)
+		// outerPaths have already been normalized to slash
+		copy(parts, s.outerPaths)
+		parts[len(s.outerPaths)] = s.Path
+		return strings.Join(parts, InnerPathSeparator)
 	}
 
 	return s.Path

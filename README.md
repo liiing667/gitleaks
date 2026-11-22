@@ -543,6 +543,17 @@ sets the potential to go that deep. It will only go as deep as it needs to.
 The findings for secrets located within an archive will include the path to the
 file inside the archive. Inner paths are separated with `!`.
 
+Archive member names and link targets are treated as logical paths rooted at
+the archive. Members that are absolute, escape the archive root, contain the
+reserved `!` separator or a backslash, or collapse onto another member's
+identity are skipped before their content is opened. Archive links whose
+target is missing, points at a directory, leaves the archive root, or forms a
+cycle are quarantined in the same pre-read phase. Temporary extraction files
+are never used as member identities, so retries and canceled scans keep the
+same logical `archive!member` path. Ordinary archives, existing path
+allowlists, and symlinks that resolve inside the controlled source or git
+worktree root keep their previous behavior.
+
 Example finding (shortened for brevity):
 
 ```

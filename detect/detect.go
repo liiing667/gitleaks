@@ -778,7 +778,9 @@ func checkCommitOrPathAllowed(
 			isAllowed        bool
 			allowlistChecks  []bool
 			commitAllowed, _ = a.CommitAllowed(fragment.CommitSHA)
-			pathAllowed      = a.PathAllowed(fragment.FilePath) || (fragment.WindowsFilePath != "" && a.PathAllowed(fragment.WindowsFilePath))
+			pathAllowed      = a.PathAllowed(fragment.FilePath) ||
+				(fragment.SymlinkFile != "" && a.PathAllowed(fragment.SymlinkFile)) ||
+				(fragment.WindowsFilePath != "" && a.PathAllowed(fragment.WindowsFilePath))
 		)
 		// If the condition is "AND" we need to check all conditions.
 		if a.MatchCondition == config.AllowlistMatchAnd {
@@ -853,7 +855,9 @@ func checkFindingAllowed(
 				checks = append(checks, commitAllowed)
 			}
 			if len(a.Paths) > 0 {
-				pathAllowed = a.PathAllowed(fragment.FilePath) || (fragment.WindowsFilePath != "" && a.PathAllowed(fragment.WindowsFilePath))
+				pathAllowed = a.PathAllowed(fragment.FilePath) ||
+					(fragment.SymlinkFile != "" && a.PathAllowed(fragment.SymlinkFile)) ||
+					(fragment.WindowsFilePath != "" && a.PathAllowed(fragment.WindowsFilePath))
 				checks = append(checks, pathAllowed)
 			}
 			if len(a.Regexes) > 0 {

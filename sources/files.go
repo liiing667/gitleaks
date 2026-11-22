@@ -17,6 +17,9 @@ import (
 type ScanTarget struct {
 	Path    string
 	Symlink string
+	// Root is the controlled scan root frozen during source discovery. The
+	// resolved Path must stay inside it.
+	Root string
 }
 
 // Deprecated: Use Files and detector.DetectSource instead
@@ -54,12 +57,23 @@ type Files struct {
 	Path            string
 	Sema            *semgroup.Group
 	MaxArchiveDepth int
+	// Root optionally fixes the controlled scan root. If empty, a root is
+	// derived from Path once when scanning starts.
+	Root string
 }
 
 // scanTargets yields scan targets to a callback func
 func (s *Files) scanTargets(ctx context.Context, yield func(ScanTarget, error) error) error {
+	root := s.Root
+	if root == "" {
+		root = controlledRootFor(s.Path)
+	}
+	return s.scanTargetsWithRoot(ctx, root, yield)
+}
+
+func (s *Files) scanTargetsWithRoot(ctx context.Context, root string, yield func(ScanTarget, error) error) error {
 	return filepath.WalkDir(s.Path, func(path string, d fs.DirEntry, err error) error {
-		scanTarget := ScanTarget{Path: path}
+		scanTarget := ScanTarget{Path: path, Root: root}
 		logger := logging.With().Str("path", path).Logger()
 
 		if err != nil {
@@ -82,7 +96,53 @@ func (s *Files) scanTargets(ctx context.Context, yield func(ScanTarget, error) e
 			return nil
 		}
 
-		if !d.IsDir() {
+		// set the initial scan target values
+		if d.Type() == fs.ModeSymlink {
+			if !s.FollowSymlinks {
+				logger.Debug().Msg("skipping symlink: follow symlinks disabled")
+				return nil
+			}
+			realPath, err := filepath.EvalSymlinks(path)
+			if err != nil {
+				logger.Error().Err(err).Msg("skipping symlink: could not evaluate")
+				return nil
+			}
+			realPathFileInfo, err := os.Stat(realPath)
+			if err != nil {
+				logger.Error().Err(err).Msg("skipping symlink: could not stat target")
+				return nil
+			}
+			if realPathFileInfo.IsDir() {
+				logger.Debug().Str("target", realPath).Msgf("skipping symlink: target is directory")
+				return nil
+			}
+			// A discovered link is only admitted when its resolved target is
+			// under the root frozen at the start of the walk. The same check
+			// is repeated immediately before the file is opened. An explicit
+			// source that is itself a link is admitted relative to its target,
+			// preserving the old single-file call behavior.
+			targetRoot := root
+			if path == s.Path && s.Root == "" {
+				targetRoot = filepath.Dir(realPath)
+				if gitRoot := findGitRoot(realPath); gitRoot != "" {
+					targetRoot = gitRoot
+				}
+			} else if !WithinRoot(root, realPath) {
+				logger.Warn().
+					Str("target", realPath).
+					Str("root", root).
+					Str("stage", "source_discovery").
+					Msg("skipping symlink: target is outside controlled root")
+				return nil
+			}
+			scanTarget = ScanTarget{
+				Path:    realPath,
+				Symlink: path,
+				Root:    targetRoot,
+			}
+		}
+
+		if !info.IsDir() {
 			// Empty; nothing to do here.
 			if info.Size() == 0 {
 				logger.Debug().Msg("skipping empty file")
@@ -99,27 +159,6 @@ func (s *Files) scanTargets(ctx context.Context, yield func(ScanTarget, error) e
 			}
 		}
 
-		// set the initial scan target values
-		if d.Type() == fs.ModeSymlink {
-			if !s.FollowSymlinks {
-				logger.Debug().Msg("skipping symlink: follow symlinks disabled")
-				return nil
-			}
-			realPath, err := filepath.EvalSymlinks(path)
-			if err != nil {
-				logger.Error().Err(err).Msg("skipping symlink: could not evaluate")
-				return nil
-			}
-			if realPathFileInfo, _ := os.Stat(realPath); realPathFileInfo.IsDir() {
-				logger.Debug().Str("target", realPath).Msgf("skipping symlink: target is directory")
-				return nil
-			}
-			scanTarget = ScanTarget{
-				Path:    realPath,
-				Symlink: path,
-			}
-		}
-
 		// handle dir cases (mainly just see if it should be skipped
 		if info.IsDir() {
 			if shouldSkipPath(s.Config, path) {
@@ -133,6 +172,10 @@ func (s *Files) scanTargets(ctx context.Context, yield func(ScanTarget, error) e
 			logger.Debug().Msg("skipping file: global allowlist")
 			return nil
 		}
+		if scanTarget.Symlink != "" && scanTarget.Path != path && shouldSkipPath(s.Config, scanTarget.Path) {
+			logger.Debug().Msg("skipping symlink: target allowlisted")
+			return nil
+		}
 
 		return yield(scanTarget, nil)
 	})
@@ -142,19 +185,38 @@ func (s *Files) scanTargets(ctx context.Context, yield func(ScanTarget, error) e
 func (s *Files) Fragments(ctx context.Context, yield FragmentsFunc) error {
 	var wg sync.WaitGroup
 
-	err := s.scanTargets(ctx, func(scanTarget ScanTarget, err error) error {
+	root := s.Root
+	if root == "" {
+		root = controlledRootFor(s.Path)
+	}
+
+	err := s.scanTargetsWithRoot(ctx, root, func(scanTarget ScanTarget, err error) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
+			if scanTarget.Root == "" {
+				scanTarget.Root = root
+			}
+			if !WithinRoot(scanTarget.Root, scanTarget.Path) {
+				logging.Warn().
+					Str("path", scanTarget.Path).
+					Str("root", scanTarget.Root).
+					Str("stage", "source_admission").
+					Msg("skipping file: outside controlled root")
+				return nil
+			}
+
 			wg.Add(1)
 			s.Sema.Go(func() error {
 				logger := logging.With().Str("path", scanTarget.Path).Logger()
 				logger.Trace().Msg("scanning path")
 
-				f, err := os.Open(scanTarget.Path)
+				f, err := OpenControlled(scanTarget.Root, scanTarget.Path)
 				if err != nil {
-					if os.IsPermission(err) {
+					if errors.Is(err, ErrPathOutsideRoot) {
+						logger.Warn().Msg("skipping file: outside controlled root")
+					} else if os.IsPermission(err) {
 						logger.Warn().Msg("skipping file: permission denied")
 					}
 					wg.Done()
@@ -166,6 +228,7 @@ func (s *Files) Fragments(ctx context.Context, yield FragmentsFunc) error {
 					Content:         f,
 					Path:            scanTarget.Path,
 					Symlink:         scanTarget.Symlink,
+					Root:            scanTarget.Root,
 					Config:          s.Config,
 					MaxArchiveDepth: s.MaxArchiveDepth,
 				}
@@ -181,11 +244,12 @@ func (s *Files) Fragments(ctx context.Context, yield FragmentsFunc) error {
 		}
 	})
 
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-		wg.Wait()
+	// Always wait for the goroutines this call scheduled. Returning as soon as
+	// the context is done would let late fragments mutate findings after the
+	// scan appeared to finish.
+	wg.Wait()
+	if err != nil {
 		return err
 	}
+	return ctx.Err()
 }
