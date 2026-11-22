@@ -1320,7 +1320,7 @@ func TestFromGit(t *testing.T) {
 			for _, f := range findings {
 				f.Match = "" // remove lines cause copying and pasting them has some wack formatting
 			}
-			assert.ElementsMatch(t, tt.expectedFindings, findings)
+			assert.ElementsMatch(t, tt.expectedFindings, withoutScanMetadata(findings))
 		})
 	}
 }
@@ -1392,8 +1392,22 @@ func TestFromGitStaged(t *testing.T) {
 		for _, f := range findings {
 			f.Match = "" // remove lines cause copying and pasting them has some wack formatting
 		}
-		assert.ElementsMatch(t, tt.expectedFindings, findings)
+		assert.ElementsMatch(t, tt.expectedFindings, withoutScanMetadata(findings))
 	}
+}
+
+func withoutScanMetadata(findings []report.Finding) []report.Finding {
+	out := make([]report.Finding, len(findings))
+	for i, finding := range findings {
+		finding.Head = ""
+		finding.CommitRange = ""
+		finding.ScanGeneration = ""
+		finding.ScanStage = ""
+		finding.ScanComplete = false
+		finding.ScanSource = ""
+		out[i] = finding
+	}
+	return out
 }
 
 // TestFromFiles tests the FromFiles function

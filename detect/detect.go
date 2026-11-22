@@ -74,6 +74,12 @@ type Detector struct {
 	// This is only used for logging purposes and git scans.
 	commitMap map[string]bool
 
+	// scanMutex protects scan, the admission and completion state for the
+	// most recent scan. A detector may be reused, but each call to
+	// DetectSource starts a new generation.
+	scanMutex sync.RWMutex
+	scan      *ScanState
+
 	// findingMutex is to prevent concurrent access to the
 	// findings slice when adding findings.
 	findingMutex *sync.Mutex
@@ -206,6 +212,8 @@ func (d *Detector) DetectString(content string) []report.Finding {
 
 // DetectSource scans the given source and returns a list of findings
 func (d *Detector) DetectSource(ctx context.Context, source sources.Source) ([]report.Finding, error) {
+	state := d.beginScan(source)
+
 	err := source.Fragments(ctx, func(fragment sources.Fragment, err error) error {
 		logContext := logging.With()
 
@@ -258,8 +266,13 @@ func (d *Detector) DetectSource(ctx context.Context, source sources.Source) ([]r
 		return nil
 	})
 
+	d.finishScan(state, err)
+
 	if _, isGit := source.(*sources.Git); isGit {
-		logging.Info().Msgf("%d commits scanned.", len(d.commitMap))
+		d.commitMutex.Lock()
+		commitCount := len(d.commitMap)
+		d.commitMutex.Unlock()
+		logging.Info().Msgf("%d commits scanned.", commitCount)
 		logging.Debug().Msg("Note: this number might be smaller than expected due to commits with no additions")
 	}
 
@@ -715,6 +728,7 @@ func (d *Detector) AddFinding(finding report.Finding) {
 	} else {
 		finding.Fingerprint = globalFingerprint
 	}
+	d.applyScanMetadata(&finding)
 
 	// check if we should ignore this finding
 	logger := logging.With().Str("finding", finding.Secret).Logger()
@@ -750,7 +764,39 @@ func (d *Detector) AddFinding(finding report.Finding) {
 
 // Findings returns the findings added to the detector
 func (d *Detector) Findings() []report.Finding {
-	return d.findings
+	d.findingMutex.Lock()
+	defer d.findingMutex.Unlock()
+	findings := make([]report.Finding, len(d.findings))
+	copy(findings, d.findings)
+	return findings
+}
+
+// WriteReport writes findings to the detector's configured report
+// destination. The current scan metadata is attached to reporters that
+// support it, and file reports are committed atomically.
+func (d *Detector) WriteReport(findings []report.Finding) error {
+	if d.Reporter == nil {
+		return nil
+	}
+
+	metadata := d.currentScanMetadata()
+	if metadata.ScanGeneration != "" {
+		for _, finding := range findings {
+			if finding.ScanGeneration != "" && finding.ScanGeneration != metadata.ScanGeneration {
+				return fmt.Errorf("refusing to write report: finding %q belongs to scan generation %q, not %q",
+					finding.Fingerprint, finding.ScanGeneration, metadata.ScanGeneration)
+			}
+		}
+	}
+
+	if metadataReporter, ok := d.Reporter.(report.MetadataReporter); ok {
+		metadataReporter.SetMetadata(metadata)
+	}
+
+	if d.ReportPath == report.StdoutReportPath {
+		return d.Reporter.Write(os.Stdout, findings)
+	}
+	return report.WriteFile(d.ReportPath, d.Reporter, findings)
 }
 
 // AddCommit synchronously adds a commit to the commit slice

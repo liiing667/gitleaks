@@ -10,11 +10,21 @@ import (
 
 type SarifReporter struct {
 	OrderedRules []config.Rule
+	Metadata     ScanMetadata
 }
 
 var _ Reporter = (*SarifReporter)(nil)
+var _ MetadataReporter = (*SarifReporter)(nil)
+
+func (r *SarifReporter) SetMetadata(metadata ScanMetadata) {
+	r.Metadata = metadata
+}
 
 func (r *SarifReporter) Write(w io.WriteCloser, findings []Finding) error {
+	if err := validateScanMetadata(findings, r.Metadata); err != nil {
+		return err
+	}
+	findings = applyScanMetadata(findings, r.Metadata)
 	sarif := Sarif{
 		Schema:  "https://json.schemastore.org/sarif-2.1.0.json",
 		Version: "2.1.0",
@@ -97,9 +107,16 @@ func getResults(findings []Finding) []Results {
 				CommitMessage: f.Message,
 				Date:          f.Date,
 				Author:        f.Author,
+				Fingerprint:   f.Fingerprint,
 			},
 			Properties: Properties{
-				Tags: f.Tags,
+				Tags:           f.Tags,
+				Head:           f.Head,
+				CommitRange:    f.CommitRange,
+				ScanGeneration: f.ScanGeneration,
+				ScanStage:      f.ScanStage,
+				ScanComplete:   f.ScanComplete,
+				ScanSource:     f.ScanSource,
 			},
 		}
 		results = append(results, r)
@@ -138,6 +155,7 @@ type PartialFingerPrints struct {
 	Author        string `json:"author"`
 	Date          string `json:"date"`
 	CommitMessage string `json:"commitMessage"`
+	Fingerprint   string `json:"fingerprint,omitempty"`
 }
 
 type Sarif struct {
@@ -200,7 +218,13 @@ type Locations struct {
 }
 
 type Properties struct {
-	Tags []string `json:"tags"`
+	Tags           []string `json:"tags"`
+	Head           string   `json:"head,omitempty"`
+	CommitRange    string   `json:"commitRange,omitempty"`
+	ScanGeneration string   `json:"scanGeneration,omitempty"`
+	ScanStage      string   `json:"scanStage,omitempty"`
+	ScanComplete   bool     `json:"scanComplete,omitempty"`
+	ScanSource     string   `json:"scanSource,omitempty"`
 }
 
 type Results struct {

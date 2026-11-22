@@ -205,6 +205,15 @@ gitleaks git --baseline-path gitleaks-report.json --report-path findings.json
 
 After running the detect command with the --baseline-path parameter, report output (findings.json) will only contain new issues.
 
+Git findings also carry the scan identity: `Head`, `CommitRange`,
+`ScanGeneration`, `ScanStage`, and `ScanComplete`. A scan records these once
+when it starts, so a later HEAD move cannot relabel old findings as part of a
+new range. A report from an interrupted scan is marked as `partial` and is
+rejected as a baseline; retrying starts a fresh generation rather than reusing
+the previous commit range. Revision ranges that are unavailable in a shallow
+clone are widened to the available history rather than leaving a coverage gap.
+Legacy baseline files without scan metadata remain readable.
+
 ## Pre-Commit hook
 
 You can run Gitleaks as a pre-commit hook by copying the example `pre-commit.py` script into

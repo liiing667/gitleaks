@@ -1,13 +1,20 @@
 package detect
 
 import (
-	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/zricethezav/gitleaks/v8/report"
 )
+
+// ErrIncompleteBaseline is returned when a baseline contains findings from a
+// scan that did not complete. Such a baseline is not coverage evidence: using
+// it would let findings from the unscanned part of the history be mistaken
+// for findings that were already accepted.
+var ErrIncompleteBaseline = errors.New("baseline was produced by an incomplete scan")
 
 func IsNew(finding report.Finding, redact uint, baseline []report.Finding) bool {
 	// Explicitly testing each property as it gives significantly better performance in comparison to cmp.Equal(). Drawback is that
@@ -40,16 +47,22 @@ func LoadBaseline(baselinePath string) ([]report.Finding, error) {
 		return nil, fmt.Errorf("could not open %s", baselinePath)
 	}
 
-	var previousFindings []report.Finding
-	err = json.Unmarshal(bytes, &previousFindings)
+	previousFindings, err := report.DecodeFindings(bytes)
 	if err != nil {
 		return nil, fmt.Errorf("the format of the file %s is not supported", baselinePath)
+	}
+	if stage, ok := incompleteBaselineStage(previousFindings); !ok {
+		return nil, fmt.Errorf("%w (stage %q)", ErrIncompleteBaseline, stage)
 	}
 
 	return previousFindings, nil
 }
 
 func (d *Detector) AddBaseline(baselinePath string, source string) error {
+	// A failed or rejected baseline must not leave an older baseline active.
+	d.baseline = nil
+	d.baselinePath = ""
+
 	if baselinePath != "" {
 		absoluteSource, err := filepath.Abs(source)
 		if err != nil {
@@ -70,6 +83,9 @@ func (d *Detector) AddBaseline(baselinePath string, source string) error {
 		if err != nil {
 			return err
 		}
+		if stage, ok := incompleteBaselineStage(baseline); !ok {
+			return fmt.Errorf("%w (stage %q)", ErrIncompleteBaseline, stage)
+		}
 
 		d.baseline = baseline
 		baselinePath = relativeBaseline
@@ -78,4 +94,34 @@ func (d *Detector) AddBaseline(baselinePath string, source string) error {
 
 	d.baselinePath = baselinePath
 	return nil
+}
+
+// SetBaseline applies findings as a baseline without reading a file. It uses
+// the same completion validation as AddBaseline.
+func (d *Detector) SetBaseline(baseline []report.Finding) error {
+	d.baseline = nil
+	d.baselinePath = ""
+	if stage, ok := incompleteBaselineStage(baseline); !ok {
+		return fmt.Errorf("%w (stage %q)", ErrIncompleteBaseline, stage)
+	}
+	d.baseline = baseline
+	return nil
+}
+
+func incompleteBaselineStage(baseline []report.Finding) (string, bool) {
+	for _, finding := range baseline {
+		stage := strings.ToLower(strings.TrimSpace(finding.ScanStage))
+		switch stage {
+		case "", report.ScanStageCompleted, "complete":
+			// Empty is the legacy JSON shape. Treating it as complete keeps
+			// baselines produced by older gitleaks versions readable.
+			continue
+		default:
+			if finding.ScanComplete && stage != report.ScanStagePartial {
+				continue
+			}
+			return stage, false
+		}
+	}
+	return "", true
 }

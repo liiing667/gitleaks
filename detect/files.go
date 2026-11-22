@@ -17,6 +17,10 @@ import (
 func (d *Detector) DetectFiles(scanTargets <-chan sources.ScanTarget) ([]report.Finding, error) {
 	var wg sync.WaitGroup
 
+	// Legacy DetectFiles calls are also scan attempts; do not let a retry
+	// inherit findings from the previous attempt.
+	state := d.beginScan(legacyFilesSource{})
+
 	for scanTarget := range scanTargets {
 		wg.Add(1)
 
@@ -88,5 +92,12 @@ func (d *Detector) DetectFiles(scanTargets <-chan sources.ScanTarget) ([]report.
 	}
 
 	wg.Wait()
-	return d.findings, nil
+	d.finishScan(state, nil)
+	return d.Findings(), nil
+}
+
+type legacyFilesSource struct{}
+
+func (legacyFilesSource) Fragments(context.Context, sources.FragmentsFunc) error {
+	return nil
 }

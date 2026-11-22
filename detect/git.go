@@ -17,6 +17,9 @@ type RemoteInfo sources.RemoteInfo
 //
 // Deprecated: Use sources.Git and detector.DetectSource instead
 func (d *Detector) DetectGit(cmd *sources.GitCmd, remote *RemoteInfo) ([]report.Finding, error) {
+	// GitCmd carries the HEAD and effective revision range captured when the
+	// scan command was admitted. DetectSource starts a fresh generation and
+	// stamps every finding from this call with that same snapshot.
 	return d.DetectSource(
 		context.Background(),
 		&sources.Git{

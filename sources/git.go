@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -31,6 +32,47 @@ type GitCmd struct {
 	diffFilesCh <-chan *gitdiff.File
 	errCh       <-chan error
 	repoPath    string
+	scanInfo    GitScanInfo
+}
+
+// GitScanInfo describes the repository state fixed when a Git command was
+// created. Keeping this separate from the live repository prevents a HEAD
+// move (or a concurrent fetch) from being attributed to an older scan.
+type GitScanInfo struct {
+	Repository  string
+	Head        string
+	CommitRange string
+	Shallow     bool
+}
+
+// ScanInfo returns the repository identity captured when the command was
+// created.
+func (c *GitCmd) ScanInfo() GitScanInfo {
+	if c == nil {
+		return GitScanInfo{}
+	}
+	return c.scanInfo
+}
+
+// Head returns the HEAD SHA captured for this command.
+func (c *GitCmd) Head() string {
+	return c.ScanInfo().Head
+}
+
+// CommitRange returns the effective revision range captured for this command.
+func (c *GitCmd) CommitRange() string {
+	return c.ScanInfo().CommitRange
+}
+
+// RepositoryPath returns the repository path used by this command.
+func (c *GitCmd) RepositoryPath() string {
+	return c.ScanInfo().Repository
+}
+
+// IsShallow reports whether the repository was shallow when the command was
+// created.
+func (c *GitCmd) IsShallow() bool {
+	return c.ScanInfo().Shallow
 }
 
 // blobReader provides a ReadCloser interface git cat-file blob to fetch
@@ -71,6 +113,7 @@ func NewGitLogCmd(source string, logOpts string) (*GitCmd, error) {
 func NewGitLogCmdContext(ctx context.Context, source string, logOpts string) (*GitCmd, error) {
 	sourceClean := filepath.Clean(source)
 	var cmd *exec.Cmd
+	scanInfo := captureGitScanInfo(ctx, sourceClean, gitRevisionRange(logOpts), true)
 	if logOpts != "" {
 		args := []string{"-C", sourceClean, "log", "-p", "-U0"}
 
@@ -87,6 +130,8 @@ func NewGitLogCmdContext(ctx context.Context, source string, logOpts string) (*G
 			logging.Warn().Msgf("the following `--log-opts` values may not work as expected: %v\n\tsee https://github.com/gitleaks/gitleaks/issues/1153 for more information", quotedOpts)
 		}
 
+		userArgs, effectiveRange := freezeGitLogArgs(ctx, sourceClean, userArgs, scanInfo)
+		scanInfo.CommitRange = effectiveRange
 		args = append(args, userArgs...)
 		cmd = exec.CommandContext(ctx, "git", args...)
 	} else {
@@ -121,6 +166,7 @@ func NewGitLogCmdContext(ctx context.Context, source string, logOpts string) (*G
 		diffFilesCh: gitdiffFiles,
 		errCh:       errCh,
 		repoPath:    sourceClean,
+		scanInfo:    scanInfo,
 	}, nil
 }
 
@@ -136,6 +182,11 @@ func NewGitDiffCmd(source string, staged bool) (*GitCmd, error) {
 func NewGitDiffCmdContext(ctx context.Context, source string, staged bool) (*GitCmd, error) {
 	sourceClean := filepath.Clean(source)
 	var cmd *exec.Cmd
+	rangeName := "worktree"
+	if staged {
+		rangeName = "staged"
+	}
+	scanInfo := captureGitScanInfo(ctx, sourceClean, rangeName, true)
 	cmd = exec.CommandContext(ctx, "git", "-C", sourceClean, "diff", "-U0", "--no-ext-diff", ".")
 	if staged {
 		cmd = exec.CommandContext(ctx, "git", "-C", sourceClean, "diff", "-U0", "--no-ext-diff",
@@ -168,7 +219,228 @@ func NewGitDiffCmdContext(ctx context.Context, source string, staged bool) (*Git
 		diffFilesCh: gitdiffFiles,
 		errCh:       errCh,
 		repoPath:    sourceClean,
+		scanInfo:    scanInfo,
 	}, nil
+}
+
+func captureGitScanInfo(ctx context.Context, source, commitRange string, includeHead bool) GitScanInfo {
+	info := GitScanInfo{
+		Repository:  source,
+		CommitRange: commitRange,
+		Shallow:     isShallowRepository(ctx, source),
+	}
+	if includeHead {
+		if head, ok := resolveGitRevision(ctx, source, "HEAD"); ok {
+			info.Head = head
+		}
+	}
+	return info
+}
+
+// gitRevisionRange extracts a human-readable revision description from the
+// user's log options. The command still receives the original options via
+// freezeGitLogArgs; this value is the fallback when no revision-like token is
+// present.
+func gitRevisionRange(logOpts string) string {
+	logOpts = strings.TrimSpace(logOpts)
+	if logOpts == "" {
+		return "--all"
+	}
+	for _, arg := range strings.Fields(logOpts) {
+		if strings.HasPrefix(arg, "-") {
+			continue
+		}
+		if strings.Contains(arg, "..") {
+			return arg
+		}
+	}
+	return logOpts
+}
+
+// freezeGitLogArgs resolves revision arguments before starting `git log`.
+// This is what makes a scan use one HEAD/range snapshot even if the repository
+// moves while the scan is running. In a shallow clone, a range whose lower
+// boundary is unavailable is widened to the available endpoint instead of
+// silently scanning only a suffix or failing the whole scan.
+func freezeGitLogArgs(ctx context.Context, repo string, args []string, info GitScanInfo) ([]string, string) {
+	effective := info.CommitRange
+	out := append([]string(nil), args...)
+	skipNextValue := false
+	pathMode := false
+
+	for i, arg := range out {
+		if pathMode {
+			continue
+		}
+		if arg == "--" {
+			pathMode = true
+			continue
+		}
+		if strings.HasPrefix(arg, "-") {
+			if gitLogOptionTakesValue(arg) {
+				skipNextValue = true
+			}
+			continue
+		}
+		if skipNextValue {
+			skipNextValue = false
+			continue
+		}
+
+		if strings.Contains(arg, "..") {
+			resolved, ok := freezeGitRange(ctx, repo, arg, info)
+			if ok {
+				out[i] = resolved
+				effective = resolved
+			}
+			continue
+		}
+
+		if resolved, ok := resolveGitRevision(ctx, repo, arg); ok {
+			out[i] = resolved
+			effective = resolved
+			continue
+		}
+
+		if info.Shallow && info.Head != "" {
+			// A legitimate shallow clone may not contain the requested old
+			// revision. Scan everything reachable from the frozen HEAD rather
+			// than leaving a hole in the history coverage.
+			logging.Warn().
+				Str("revision", arg).
+				Str("head", info.Head).
+				Msg("revision is unavailable in shallow clone; scanning available history")
+			out[i] = info.Head
+			effective = info.Head
+		}
+	}
+
+	if effective == "" {
+		effective = info.CommitRange
+	}
+	return out, effective
+}
+
+func freezeGitRange(ctx context.Context, repo, arg string, info GitScanInfo) (string, bool) {
+	left, right, sep, ok := splitGitRange(arg)
+	if !ok {
+		return "", false
+	}
+
+	leftResolved, leftOK := resolveGitRangeEndpoint(ctx, repo, left, info.Head)
+	rightResolved, rightOK := resolveGitRangeEndpoint(ctx, repo, right, info.Head)
+	if leftOK && rightOK {
+		return leftResolved + sep + rightResolved, true
+	}
+
+	if !info.Shallow {
+		return "", false
+	}
+
+	switch {
+	case rightOK:
+		logging.Warn().
+			Str("range", arg).
+			Str("revision", rightResolved).
+			Msg("lower revision boundary is unavailable in shallow clone; scanning available history")
+		return rightResolved, true
+	case leftOK:
+		logging.Warn().
+			Str("range", arg).
+			Str("revision", leftResolved).
+			Msg("upper revision boundary is unavailable in shallow clone; scanning available history")
+		return leftResolved, true
+	case info.Head != "":
+		logging.Warn().
+			Str("range", arg).
+			Str("revision", info.Head).
+			Msg("revision range is unavailable in shallow clone; scanning available history")
+		return info.Head, true
+	default:
+		return "", false
+	}
+}
+
+func splitGitRange(arg string) (left, right, sep string, ok bool) {
+	if idx := strings.Index(arg, "..."); idx >= 0 {
+		return arg[:idx], arg[idx+3:], "...", true
+	}
+	if idx := strings.Index(arg, ".."); idx >= 0 {
+		return arg[:idx], arg[idx+2:], "..", true
+	}
+	return "", "", "", false
+}
+
+func resolveGitRangeEndpoint(ctx context.Context, repo, endpoint, head string) (string, bool) {
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		endpoint = head
+	}
+	if endpoint == "" {
+		return "", false
+	}
+	return resolveGitRevision(ctx, repo, endpoint)
+}
+
+func resolveGitRevision(ctx context.Context, repo, revision string) (string, bool) {
+	revision = strings.TrimSpace(revision)
+	if revision == "" {
+		return "", false
+	}
+	out, err := gitCommandOutput(ctx, repo, "rev-parse", "--verify", revision+"^{commit}")
+	if err != nil {
+		out, err = gitCommandOutput(ctx, repo, "rev-parse", "--verify", revision)
+	}
+	if err != nil {
+		return "", false
+	}
+	resolved := strings.TrimSpace(string(out))
+	return resolved, resolved != ""
+}
+
+func isShallowRepository(ctx context.Context, repo string) bool {
+	out, err := gitCommandOutput(ctx, repo, "rev-parse", "--is-shallow-repository")
+	if err == nil {
+		return strings.EqualFold(strings.TrimSpace(string(out)), "true")
+	}
+
+	// Older Git versions do not understand --is-shallow-repository. Fall back
+	// to the shallow file in the git directory.
+	out, err = gitCommandOutput(ctx, repo, "rev-parse", "--git-dir")
+	if err != nil {
+		return false
+	}
+	gitDir := strings.TrimSpace(string(out))
+	if !filepath.IsAbs(gitDir) {
+		gitDir = filepath.Join(repo, gitDir)
+	}
+	_, err = os.Stat(filepath.Join(gitDir, "shallow"))
+	return err == nil
+}
+
+func gitCommandOutput(ctx context.Context, repo string, args ...string) ([]byte, error) {
+	gitArgs := append([]string{"-C", repo}, args...)
+	cmd := exec.CommandContext(ctx, "git", gitArgs...)
+	cmd.Env = append(os.Environ(),
+		"GIT_TERMINAL_PROMPT=0",
+		"LC_ALL=C",
+	)
+	return cmd.Output()
+}
+
+func gitLogOptionTakesValue(arg string) bool {
+	if strings.Contains(arg, "=") {
+		return false
+	}
+	switch arg {
+	case "-n", "--max-count", "--skip", "--since", "--after", "--until",
+		"--before", "--author", "--committer", "--grep", "--format",
+		"--date", "--diff-filter", "--max-parents", "--min-parents",
+		"--ancestry-path", "--glob", "--exclude":
+		return true
+	default:
+		return false
+	}
 }
 
 // DiffFilesCh returns a channel with *gitdiff.File.
@@ -285,6 +557,15 @@ type Git struct {
 	MaxArchiveDepth int
 }
 
+// ScanInfo returns the repository identity frozen by the command that backs
+// this Git source.
+func (s *Git) ScanInfo() GitScanInfo {
+	if s == nil || s.Cmd == nil {
+		return GitScanInfo{}
+	}
+	return s.Cmd.ScanInfo()
+}
+
 // CommitInfo captures metadata about the commit
 type CommitInfo struct {
 	AuthorEmail string
@@ -313,6 +594,10 @@ func (s *Git) Fragments(ctx context.Context, yield FragmentsFunc) error {
 	for diffFilesCh != nil || errCh != nil {
 		select {
 		case <-ctx.Done():
+			// Let every producer that already passed the cancellation check
+			// finish. DetectSource must not return while a worker can still
+			// append a finding to the previous scan.
+			wg.Wait()
 			return ctx.Err()
 		case gitdiffFile, open := <-diffFilesCh:
 			if !open {
@@ -423,9 +708,13 @@ func (s *Git) Fragments(ctx context.Context, yield FragmentsFunc) error {
 
 	select {
 	case <-ctx.Done():
+		wg.Wait()
 		return ctx.Err()
 	default:
 		wg.Wait()
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		return nil
 	}
 }
