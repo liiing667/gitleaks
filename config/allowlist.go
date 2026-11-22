@@ -2,11 +2,13 @@ package config
 
 import (
 	"errors"
+	"sort"
 	"strings"
 
 	ahocorasick "github.com/BobuSumisu/aho-corasick"
 	"golang.org/x/exp/maps"
 
+	"github.com/zricethezav/gitleaks/v8/logging"
 	"github.com/zricethezav/gitleaks/v8/regexp"
 )
 
@@ -58,6 +60,12 @@ type Allowlist struct {
 
 	// validated is an internal flag to track whether `Validate()` has been called.
 	validated bool
+
+	// sourcePath is the path of the config file that defined this
+	// allowlist ("default" for the embedded default config). It is used
+	// to trace a suppression back to its source. It may be empty for
+	// configs that were not loaded from a file.
+	sourcePath string
 
 	// commitMap is a normalized version of Commits, used for efficiency purposes.
 	// TODO: possible optimizations so that both short and long hashes work.
@@ -111,6 +119,84 @@ func (a *Allowlist) Validate() error {
 
 	a.validated = true
 	return nil
+}
+
+// SourcePath returns the path of the config file that defined this
+// allowlist, or "default" for the embedded default config. It may be
+// empty if the config was not loaded from a file.
+func (a *Allowlist) SourcePath() string {
+	if a == nil {
+		return ""
+	}
+	return a.sourcePath
+}
+
+// identity returns a canonical representation of the allowlist's matching
+// behavior. Two allowlists with the same identity suppress exactly the
+// same findings, so keeping both would only suppress the same finding
+// twice. The description is intentionally not part of the identity.
+func (a *Allowlist) identity() string {
+	var sb strings.Builder
+	sb.WriteString(a.MatchCondition.String())
+	sb.WriteString("\x00target:")
+	sb.WriteString(a.RegexTarget)
+
+	writeValues := func(prefix string, values []string) {
+		if len(values) == 0 {
+			return
+		}
+		sorted := make([]string, len(values))
+		copy(sorted, values)
+		sort.Strings(sorted)
+		sb.WriteString("\x00")
+		sb.WriteString(prefix)
+		sb.WriteString(":")
+		sb.WriteString(strings.Join(sorted, "\x1f"))
+	}
+
+	writeValues("commits", a.Commits)
+	writeValues("stopwords", a.StopWords)
+
+	paths := make([]string, 0, len(a.Paths))
+	for _, p := range a.Paths {
+		paths = append(paths, p.String())
+	}
+	writeValues("paths", paths)
+
+	regexes := make([]string, 0, len(a.Regexes))
+	for _, re := range a.Regexes {
+		regexes = append(regexes, re.String())
+	}
+	writeValues("regexes", regexes)
+
+	return sb.String()
+}
+
+// dedupeAllowlists removes duplicate allowlists (allowlists with identical
+// matching behavior), keeping the first occurrence so that the existing
+// precedence is preserved.
+func dedupeAllowlists(allowlists []*Allowlist) []*Allowlist {
+	if len(allowlists) < 2 {
+		return allowlists
+	}
+	seen := make(map[string]struct{}, len(allowlists))
+	deduped := make([]*Allowlist, 0, len(allowlists))
+	for _, a := range allowlists {
+		if a == nil {
+			deduped = append(deduped, a)
+			continue
+		}
+		id := a.identity()
+		if _, ok := seen[id]; ok {
+			logging.Debug().
+				Str("description", a.Description).
+				Msg("dropping duplicate allowlist")
+			continue
+		}
+		seen[id] = struct{}{}
+		deduped = append(deduped, a)
+	}
+	return deduped
 }
 
 // CommitAllowed returns true if the commit is allowed to be ignored.

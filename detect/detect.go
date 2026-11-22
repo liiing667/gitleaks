@@ -83,6 +83,15 @@ type Detector struct {
 	// report.
 	findings []report.Finding
 
+	// suppressionMutex is to prevent concurrent access to the
+	// suppressions slice when adding suppressions.
+	suppressionMutex *sync.Mutex
+
+	// suppressions is a slice of Suppression records: findings (or whole
+	// fragments) that were suppressed by an allowlist, along with the
+	// provenance of the allowlist responsible for the suppression.
+	suppressions []Suppression
+
 	// prefilter is a ahocorasick struct used for doing efficient string
 	// matching given a set of words (keywords from the rules in the config)
 	prefilter ahocorasick.Trie
@@ -120,26 +129,31 @@ func NewDetector(cfg config.Config) *Detector {
 // context to use for timeouts
 func NewDetectorContext(ctx context.Context, cfg config.Config) *Detector {
 	return &Detector{
-		commitMap:      make(map[string]bool),
-		gitleaksIgnore: make(map[string]struct{}),
-		findingMutex:   &sync.Mutex{},
-		commitMutex:    &sync.Mutex{},
-		findings:       make([]report.Finding, 0),
-		Config:         cfg,
-		prefilter:      *ahocorasick.NewTrieBuilder().AddStrings(maps.Keys(cfg.Keywords)).Build(),
-		Sema:           semgroup.NewGroup(ctx, 40),
+		commitMap:        make(map[string]bool),
+		gitleaksIgnore:   make(map[string]struct{}),
+		findingMutex:     &sync.Mutex{},
+		commitMutex:      &sync.Mutex{},
+		findings:         make([]report.Finding, 0),
+		suppressionMutex: &sync.Mutex{},
+		suppressions:     make([]Suppression, 0),
+		Config:           cfg,
+		prefilter:        *ahocorasick.NewTrieBuilder().AddStrings(maps.Keys(cfg.Keywords)).Build(),
+		Sema:             semgroup.NewGroup(ctx, 40),
 	}
 }
 
 // NewDetectorDefaultConfig creates a new detector with the default config
 func NewDetectorDefaultConfig() (*Detector, error) {
-	viper.SetConfigType("toml")
-	err := viper.ReadConfig(strings.NewReader(config.DefaultConfig))
+	// Use a dedicated viper instance so loading the default config does
+	// not clobber the process-wide viper state of the caller.
+	v := viper.New()
+	v.SetConfigType("toml")
+	err := v.ReadConfig(strings.NewReader(config.DefaultConfig))
 	if err != nil {
 		return nil, err
 	}
 	var vc config.ViperConfig
-	err = viper.Unmarshal(&vc)
+	err = v.Unmarshal(&vc)
 	if err != nil {
 		return nil, err
 	}
@@ -299,8 +313,9 @@ func (d *Detector) DetectContext(ctx context.Context, fragment Fragment) []repor
 		}
 	}
 	// check if commit or filepath is allowed.
-	if isAllowed, event := checkCommitOrPathAllowed(logger, fragment, d.Config.Allowlists); isAllowed {
+	if isAllowed, allowlist, event := checkCommitOrPathAllowed(logger, fragment, d.Config.Allowlists); isAllowed {
 		event.Msg("skipping file: global allowlist")
+		d.addSuppression(suppressionForFragment(fragment), SuppressionScopeGlobal, "", allowlist)
 		return findings
 	}
 
@@ -385,8 +400,9 @@ func (d *Detector) detectRule(fragment Fragment, currentRaw string, r config.Rul
 	}
 
 	// check if commit or file is allowed for this rule.
-	if isAllowed, event := checkCommitOrPathAllowed(logger, fragment, r.Allowlists); isAllowed {
+	if isAllowed, allowlist, event := checkCommitOrPathAllowed(logger, fragment, r.Allowlists); isAllowed {
 		event.Msg("skipping file: rule allowlist")
+		d.addSuppression(suppressionForFragment(fragment), SuppressionScopeRule, r.RuleID, allowlist)
 		return findings
 	}
 
@@ -554,14 +570,16 @@ func (d *Detector) detectRule(fragment Fragment, currentRaw string, r config.Rul
 		}
 
 		// check if the result matches any of the global allowlists.
-		if isAllowed, event := checkFindingAllowed(logger, finding, fragment, currentLine, d.Config.Allowlists); isAllowed {
+		if isAllowed, allowlist, event := checkFindingAllowed(logger, finding, fragment, currentLine, d.Config.Allowlists); isAllowed {
 			event.Msg("skipping finding: global allowlist")
+			d.addSuppression(finding, SuppressionScopeGlobal, "", allowlist)
 			continue
 		}
 
 		// check if the result matches any of the rule allowlists.
-		if isAllowed, event := checkFindingAllowed(logger, finding, fragment, currentLine, r.Allowlists); isAllowed {
+		if isAllowed, allowlist, event := checkFindingAllowed(logger, finding, fragment, currentLine, r.Allowlists); isAllowed {
 			event.Msg("skipping finding: rule allowlist")
+			d.addSuppression(finding, SuppressionScopeRule, r.RuleID, allowlist)
 			continue
 		}
 		findings = append(findings, finding)
@@ -753,6 +771,74 @@ func (d *Detector) Findings() []report.Finding {
 	return d.findings
 }
 
+const (
+	// SuppressionScopeGlobal indicates that a finding (or fragment) was
+	// suppressed by a global (config-wide) allowlist.
+	SuppressionScopeGlobal = "global"
+	// SuppressionScopeRule indicates that a finding (or fragment) was
+	// suppressed by a rule-specific allowlist.
+	SuppressionScopeRule = "rule"
+)
+
+// Suppression describes a suppression that occurred during a scan: either
+// a finding that was dropped because it matched an allowlist, or a
+// fragment (file/commit) that was skipped entirely. It carries enough
+// provenance to locate the source of the suppression.
+type Suppression struct {
+	// Finding is the finding that was suppressed. For fragment-level
+	// suppressions (an entire file or commit skipped by a commit/path
+	// allowlist) only the file and commit information is populated.
+	Finding report.Finding
+
+	// Scope is "global" or "rule", depending on which allowlist matched.
+	Scope string
+
+	// RuleID is the ID of the rule whose allowlist caused the
+	// suppression. It is empty for global allowlists.
+	RuleID string
+
+	// AllowlistDescription is the description of the allowlist
+	// responsible for the suppression, if one was provided.
+	AllowlistDescription string
+
+	// AllowlistSource is the path of the config file that defined the
+	// allowlist ("default" for the embedded default config). It may be
+	// empty for configs that were not loaded from a file.
+	AllowlistSource string
+}
+
+// suppressionForFragment builds the placeholder finding recorded when a
+// whole fragment is skipped by a commit/path allowlist.
+func suppressionForFragment(fragment Fragment) report.Finding {
+	return report.Finding{
+		File:   fragment.FilePath,
+		Commit: fragment.CommitSHA,
+	}
+}
+
+// addSuppression synchronously records a suppression caused by an
+// allowlist, binding it to this detector's config generation.
+func (d *Detector) addSuppression(finding report.Finding, scope, ruleID string, allowlist *config.Allowlist) {
+	s := Suppression{
+		Finding: finding,
+		Scope:   scope,
+		RuleID:  ruleID,
+	}
+	if allowlist != nil {
+		s.AllowlistDescription = allowlist.Description
+		s.AllowlistSource = allowlist.SourcePath()
+	}
+	d.suppressionMutex.Lock()
+	d.suppressions = append(d.suppressions, s)
+	d.suppressionMutex.Unlock()
+}
+
+// Suppressions returns the suppressions recorded during the scan, each
+// paired with the provenance of the allowlist responsible for it.
+func (d *Detector) Suppressions() []Suppression {
+	return d.suppressions
+}
+
 // AddCommit synchronously adds a commit to the commit slice
 func (d *Detector) addCommit(commit string) {
 	d.commitMutex.Lock()
@@ -764,13 +850,16 @@ func (d *Detector) addCommit(commit string) {
 //
 // If the match condition is "OR", only commit and path are checked.
 // Otherwise, if regexes or stopwords are defined this will fail.
+//
+// When the fragment is allowed, the allowlist responsible is returned so
+// the suppression can be traced back to its source.
 func checkCommitOrPathAllowed(
 	logger zerolog.Logger,
 	fragment Fragment,
 	allowlists []*config.Allowlist,
-) (bool, *zerolog.Event) {
+) (bool, *config.Allowlist, *zerolog.Event) {
 	if fragment.FilePath == "" && fragment.CommitSHA == "" {
-		return false, nil
+		return false, nil, nil
 	}
 
 	for _, a := range allowlists {
@@ -808,16 +897,20 @@ func checkCommitOrPathAllowed(
 			if pathAllowed {
 				event.Bool("allowed-path", pathAllowed)
 			}
-			return true, event
+			logAllowlistSource(event, a)
+			return true, a, event
 		}
 	}
-	return false, nil
+	return false, nil, nil
 }
 
 // checkFindingAllowed evaluates |finding| against all provided |allowlists|.
 //
 // If the match condition is "OR", only regex and stopwords are run. (Commit and path should be handled separately).
 // Otherwise, all conditions are checked.
+//
+// When the finding is allowed, the allowlist responsible is returned so
+// the suppression can be traced back to its source.
 //
 // TODO: The method signature is awkward. I can't think of a better way to log helpful info.
 func checkFindingAllowed(
@@ -826,7 +919,7 @@ func checkFindingAllowed(
 	fragment Fragment,
 	currentLine string,
 	allowlists []*config.Allowlist,
-) (bool, *zerolog.Event) {
+) (bool, *config.Allowlist, *zerolog.Event) {
 	for _, a := range allowlists {
 		allowlistTarget := finding.Secret
 		switch a.RegexTarget {
@@ -884,10 +977,25 @@ func checkFindingAllowed(
 			if containsStopword {
 				event.Str("allowed-stopword", word)
 			}
-			return true, event
+			logAllowlistSource(event, a)
+			return true, a, event
 		}
 	}
-	return false, nil
+	return false, nil, nil
+}
+
+// logAllowlistSource enriches a suppression log event with the provenance
+// of the allowlist responsible for the suppression.
+func logAllowlistSource(event *zerolog.Event, a *config.Allowlist) {
+	if a == nil {
+		return
+	}
+	if a.Description != "" {
+		event.Str("allowlist-description", a.Description)
+	}
+	if source := a.SourcePath(); source != "" {
+		event.Str("allowlist-source", source)
+	}
 }
 
 func allTrue(bools []bool) bool {

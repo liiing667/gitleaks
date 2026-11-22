@@ -1,0 +1,13 @@
+title = "global allowlist base"
+
+[[rules]]
+    id = "base-rule"
+    regex = '''base-[0-9]+'''
+
+[[allowlists]]
+    description = "shared suppression"
+    regexes = ['''.*fake.*''']
+
+[[allowlists]]
+    description = "base-only suppression"
+    paths = ['''(?:^|/)node_modules(?:/.*)?$''']

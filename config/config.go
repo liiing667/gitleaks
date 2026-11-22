@@ -15,15 +15,14 @@ import (
 	"github.com/zricethezav/gitleaks/v8/version"
 )
 
-var (
-	//go:embed gitleaks.toml
-	DefaultConfig string
+//go:embed gitleaks.toml
+var DefaultConfig string
 
-	// use to keep track of how many configs we can extend
-	// yea I know, globals bad
-	extendDepth int
-)
-
+// maxExtendDepth is the maximum number of times a config may extend another
+// config. The depth is tracked per config load (see ViperConfig.translate),
+// NOT in package-level state, so that every load is an independent
+// "generation": reloading a config, or recovering from a failed load, can
+// never leak extend state into the next load.
 const maxExtendDepth = 2
 
 // ViperConfig is the config struct used by the Viper config package
@@ -106,7 +105,17 @@ type Extend struct {
 	DisabledRules []string
 }
 
+// Translate converts the viper config into a Config. Each call is a
+// self-contained config generation: no state is shared with, or leaked into,
+// previous or subsequent calls.
 func (vc *ViperConfig) Translate() (Config, error) {
+	return vc.translate(0)
+}
+
+// translate is the recursive worker for Translate. |depth| is the extend
+// depth of the current config within this generation (0 for the top-level
+// config).
+func (vc *ViperConfig) translate(depth int) (Config, error) {
 	var (
 		keywords       = make(map[string]struct{})
 		orderedRules   []string
@@ -204,9 +213,9 @@ func (vc *ViperConfig) Translate() (Config, error) {
 		MinVersion:   vc.MinVersion,
 	}
 
-	if extendDepth > 0 {
-		// annoying hack to set the current config with the extended path
-		// since if extendDepth > 0 we are operating an extended config.
+	if depth > 0 {
+		// If depth > 0 we are operating on an extended config, whose path
+		// was recorded on the viper config by the extending config.
 		c.Path = vc.configPath
 	} else {
 		// I don't love this
@@ -241,25 +250,24 @@ func (vc *ViperConfig) Translate() (Config, error) {
 		}
 	}
 
-	currentExtendDepth := extendDepth
-	if maxExtendDepth != currentExtendDepth {
+	if depth < maxExtendDepth {
 		// disallow both usedefault and path from being set
 		if c.Extend.Path != "" && c.Extend.UseDefault {
 			return Config{}, errors.New("unable to load config due to extend.path and extend.useDefault being set")
 		}
 		if c.Extend.UseDefault {
-			if err := c.extendDefault(vc); err != nil {
+			if err := c.extendDefault(depth); err != nil {
 				return Config{}, err
 			}
 		} else if c.Extend.Path != "" {
-			if err := c.extendPath(vc); err != nil {
+			if err := c.extendPath(depth); err != nil {
 				return Config{}, err
 			}
 		}
 	}
 
 	// Validate the rules after everything has been assembled (including extended configs).
-	if currentExtendDepth == 0 {
+	if depth == 0 {
 		for _, rule := range c.Rules {
 			if err := rule.Validate(); err != nil {
 				return Config{}, err
@@ -274,6 +282,31 @@ func (vc *ViperConfig) Translate() (Config, error) {
 			}
 			rule.Allowlists = append(rule.Allowlists, allowlists...)
 			c.Rules[ruleID] = rule
+		}
+
+		// Bind the allowlists to this config generation. Backfill the
+		// provenance of allowlists that don't know where they were defined
+		// (i.e. allowlists owned by the top-level config; allowlists pulled
+		// in via |extend| were tagged by their own config), then drop
+		// duplicate allowlists so that a finding is suppressed by exactly
+		// one allowlist per scope and the suppression can be traced back
+		// to its source.
+		for _, a := range c.Allowlists {
+			if a != nil && a.sourcePath == "" {
+				a.sourcePath = c.Path
+			}
+		}
+		c.Allowlists = dedupeAllowlists(c.Allowlists)
+		for ruleID, rule := range c.Rules {
+			for _, a := range rule.Allowlists {
+				if a != nil && a.sourcePath == "" {
+					a.sourcePath = c.Path
+				}
+			}
+			if len(rule.Allowlists) > 1 {
+				rule.Allowlists = dedupeAllowlists(rule.Allowlists)
+				c.Rules[ruleID] = rule
+			}
 		}
 	}
 
@@ -355,6 +388,11 @@ func (vc *ViperConfig) parseAllowlist(a *viperRuleAllowlist) (*Allowlist, error)
 		RegexTarget:    regexTarget,
 		Regexes:        allowlistRegexes,
 		StopWords:      a.StopWords,
+		// Tag the allowlist with the config that defined it so that
+		// suppressions can be traced back to their source. This is empty
+		// for the top-level config; it is backfilled with the config's
+		// path when the generation is finalized in translate().
+		sourcePath: vc.configPath,
 	}
 	if err := allowlist.Validate(); err != nil {
 		return nil, err
@@ -372,17 +410,21 @@ func (c *Config) GetOrderedRules() []Rule {
 	return orderedRules
 }
 
-func (c *Config) extendDefault(parent *ViperConfig) error {
-	extendDepth++
-	viper.SetConfigType("toml")
-	if err := viper.ReadConfig(strings.NewReader(DefaultConfig)); err != nil {
+func (c *Config) extendDefault(depth int) error {
+	// Use a dedicated viper instance so that loading an extended config
+	// never clobbers the caller's (process-wide) viper state. Combined
+	// with the per-generation depth tracking this guarantees that a
+	// failed or repeated load cannot partially take effect.
+	v := viper.New()
+	v.SetConfigType("toml")
+	if err := v.ReadConfig(strings.NewReader(DefaultConfig)); err != nil {
 		return fmt.Errorf("failed to load extended default config, err: %w", err)
 	}
-	defaultViperConfig := ViperConfig{}
-	if err := viper.Unmarshal(&defaultViperConfig); err != nil {
+	defaultViperConfig := ViperConfig{configPath: "default"}
+	if err := v.Unmarshal(&defaultViperConfig); err != nil {
 		return fmt.Errorf("failed to load extended default config, err: %w", err)
 	}
-	cfg, err := defaultViperConfig.Translate()
+	cfg, err := defaultViperConfig.translate(depth + 1)
 	if err != nil {
 		return fmt.Errorf("failed to load extended default config, err: %w", err)
 
@@ -392,20 +434,20 @@ func (c *Config) extendDefault(parent *ViperConfig) error {
 	return nil
 }
 
-func (c *Config) extendPath(parent *ViperConfig) error {
-	extendDepth++
-	viper.SetConfigFile(c.Extend.Path)
-	if err := viper.ReadInConfig(); err != nil {
+func (c *Config) extendPath(depth int) error {
+	// See extendDefault for why a dedicated viper instance is used here.
+	v := viper.New()
+	v.SetConfigFile(c.Extend.Path)
+	if err := v.ReadInConfig(); err != nil {
 		return fmt.Errorf("failed to load extended config, err: %w", err)
 	}
-	extensionViperConfig := ViperConfig{}
-	if err := viper.Unmarshal(&extensionViperConfig); err != nil {
+	extensionViperConfig := ViperConfig{configPath: c.Extend.Path}
+	if err := v.Unmarshal(&extensionViperConfig); err != nil {
 		return fmt.Errorf("failed to load extended config, err: %w", err)
 	}
 
-	extensionViperConfig.configPath = c.Extend.Path
 	logging.Debug().Msgf("extending config with %s", c.Extend.Path)
-	cfg, err := extensionViperConfig.Translate()
+	cfg, err := extensionViperConfig.translate(depth + 1)
 	if err != nil {
 		return fmt.Errorf("failed to load extended config, err: %w", err)
 	}

@@ -579,7 +579,6 @@ func TestTranslateExtend(t *testing.T) {
 func testTranslate(t *testing.T, test translateCase) {
 	t.Helper()
 	t.Cleanup(func() {
-		extendDepth = 0
 		viper.Reset()
 	})
 
@@ -627,6 +626,150 @@ func testTranslate(t *testing.T, test translateCase) {
 	if diff := cmp.Diff(test.cfg.Allowlists, cfg.Allowlists, opts); diff != "" {
 		t.Errorf("%s diff: (-want +got)\n%s", test.cfgName, diff)
 	}
+}
+
+// loadConfig loads and translates a config the same way the production
+// entrypoints do, simulating a full config load (one "generation").
+func loadConfigGeneration(t *testing.T, cfgName string) (Config, error) {
+	t.Helper()
+	viper.Reset()
+	viper.AddConfigPath(configPath)
+	viper.SetConfigName(cfgName)
+	viper.SetConfigType("toml")
+	if err := viper.ReadInConfig(); err != nil {
+		return Config{}, err
+	}
+	var vc ViperConfig
+	if err := viper.Unmarshal(&vc); err != nil {
+		return Config{}, err
+	}
+	return vc.Translate()
+}
+
+// Each config load must be an independent generation: repeated loads of the
+// same extending config must produce the same rules, and a failed load must
+// not leave behind state (e.g. a partially consumed extend depth) that
+// changes the result of subsequent loads.
+func TestTranslateExtendGenerationsAreIndependent(t *testing.T) {
+	t.Cleanup(func() { viper.Reset() })
+
+	wantRules := []string{"aws-access-key", "aws-secret-key", "aws-secret-key-again"}
+
+	first, err := loadConfigGeneration(t, "valid/extend")
+	require.NoError(t, err)
+	for _, id := range wantRules {
+		require.Contains(t, first.Rules, id, "first generation is missing extended rule %s", id)
+	}
+
+	// A failed load (the extended file does not exist) must not partially
+	// take effect.
+	_, err = loadConfigGeneration(t, "invalid/extend_invalid_base")
+	require.Error(t, err)
+
+	second, err := loadConfigGeneration(t, "valid/extend")
+	require.NoError(t, err)
+	for _, id := range wantRules {
+		require.Contains(t, second.Rules, id, "second generation is missing extended rule %s", id)
+	}
+	assert.Equal(t, len(first.Rules), len(second.Rules), "generations produced different rule sets")
+	assert.Equal(t, first.OrderedRules, second.OrderedRules)
+}
+
+// Extending a config must not clobber the process-wide viper state: after a
+// load, the caller's view of the config must still be the child config, not
+// one of the extended (parent) configs.
+func TestTranslateExtendDoesNotClobberGlobalViper(t *testing.T) {
+	t.Cleanup(func() { viper.Reset() })
+
+	viper.AddConfigPath(configPath)
+	viper.SetConfigName("valid/extend")
+	viper.SetConfigType("toml")
+	require.NoError(t, viper.ReadInConfig())
+	childPath := viper.ConfigFileUsed()
+
+	var vc ViperConfig
+	require.NoError(t, viper.Unmarshal(&vc))
+	_, err := vc.Translate()
+	require.NoError(t, err)
+
+	assert.Equal(t, childPath, viper.ConfigFileUsed(),
+		"global viper points at an extended config instead of the child config")
+	var reloaded ViperConfig
+	require.NoError(t, viper.Unmarshal(&reloaded))
+	// The child config defines "aws-secret-key"; the extended (parent)
+	// configs define other rules.
+	require.Len(t, reloaded.Rules, 1)
+	assert.Equal(t, "aws-secret-key", reloaded.Rules[0].ID,
+		"global viper holds an extended (parent) config after load")
+}
+
+// Allowlists pulled in via |extend| must record where they were defined,
+// and identical allowlists defined in both the child and the parent config
+// must be collapsed so a finding is suppressed by a single allowlist.
+func TestTranslateExtendAllowlistProvenanceAndDedup(t *testing.T) {
+	t.Cleanup(func() { viper.Reset() })
+
+	cfg, err := loadConfigGeneration(t, "valid/extend_global_allowlist")
+	require.NoError(t, err)
+
+	// Both rules survived the merge.
+	require.Contains(t, cfg.Rules, "child-rule")
+	require.Contains(t, cfg.Rules, "base-rule")
+
+	// The child and the base config define an identical global allowlist
+	// ("shared suppression"); it must appear exactly once.
+	require.Len(t, cfg.Allowlists, 2)
+
+	// The child's allowlist keeps its slot (existing precedence), and each
+	// allowlist records the config that defined it.
+	assert.Equal(t, "shared suppression", cfg.Allowlists[0].Description)
+	assert.Contains(t, cfg.Allowlists[0].SourcePath(), "extend_global_allowlist.toml")
+	assert.Equal(t, "base-only suppression", cfg.Allowlists[1].Description)
+	assert.Contains(t, cfg.Allowlists[1].SourcePath(), "extend_global_allowlist_base.toml")
+}
+
+// Rule allowlists merged from an extended config must record which config
+// defined them.
+func TestTranslateExtendRuleAllowlistProvenance(t *testing.T) {
+	t.Cleanup(func() { viper.Reset() })
+
+	cfg, err := loadConfigGeneration(t, "valid/extend_rule_allowlist_or")
+	require.NoError(t, err)
+
+	rule, ok := cfg.Rules["aws-secret-key-again-again"]
+	require.True(t, ok, "merged rule is missing")
+	require.Len(t, rule.Allowlists, 2)
+	// Existing merge order is preserved: base allowlists first, then the
+	// child's.
+	assert.Contains(t, rule.Allowlists[0].SourcePath(), "extend_rule_allowlist_base.toml")
+	assert.Contains(t, rule.Allowlists[1].SourcePath(), "extend_rule_allowlist_or.toml")
+}
+
+// Allowlists coming from the embedded default config must be traceable to
+// it, and allowlists added by the child config must be traceable to the
+// child.
+func TestTranslateExtendDefaultAllowlistProvenance(t *testing.T) {
+	t.Cleanup(func() { viper.Reset() })
+
+	cfg, err := loadConfigGeneration(t, "valid/allowlist_rule_extend_default")
+	require.NoError(t, err)
+
+	// The global allowlist comes from the embedded default config.
+	require.Len(t, cfg.Allowlists, 1)
+	assert.Equal(t, "default", cfg.Allowlists[0].SourcePath())
+
+	// The child's rule allowlist is merged into the default rule and
+	// carries the child config's path.
+	rule, ok := cfg.Rules["generic-api-key"]
+	require.True(t, ok, "extended default rule is missing")
+	var childAllowlist *Allowlist
+	for _, a := range rule.Allowlists {
+		if a.Description == "Exclude a specific file from generic-api-key rule" {
+			childAllowlist = a
+		}
+	}
+	require.NotNil(t, childAllowlist, "child rule allowlist was not merged")
+	assert.Contains(t, childAllowlist.SourcePath(), "allowlist_rule_extend_default.toml")
 }
 
 func TestExtendedRuleKeywordsAreDowncase(t *testing.T) {

@@ -1,0 +1,14 @@
+title = "global allowlist child"
+
+[extend]
+path = "../testdata/config/valid/extend_global_allowlist_base.toml"
+
+[[rules]]
+    id = "child-rule"
+    regex = '''child-[0-9a-z-]+'''
+
+# Identical to the global allowlist in the base config: after the merge it
+# must only suppress a finding once.
+[[allowlists]]
+    description = "shared suppression"
+    regexes = ['''.*fake.*''']

@@ -2588,6 +2588,147 @@ func TestWindowsFileSeparator_RulePath(t *testing.T) {
 	}
 }
 
+// loadDetectorConfig loads and translates a config the same way the
+// production entrypoints do, simulating one full config load ("generation").
+func loadDetectorConfig(t *testing.T, cfgName string) config.Config {
+	t.Helper()
+	viper.Reset()
+	viper.AddConfigPath(configPath)
+	viper.SetConfigName(cfgName)
+	viper.SetConfigType("toml")
+	require.NoError(t, viper.ReadInConfig())
+	var vc config.ViperConfig
+	require.NoError(t, viper.Unmarshal(&vc))
+	cfg, err := vc.Translate()
+	require.NoError(t, err)
+	return cfg
+}
+
+// A suppressed finding (or skipped fragment) must be traceable back to the
+// allowlist that suppressed it: which scope matched, which rule it belongs
+// to, and which config file defined the allowlist.
+func TestDetectRecordsSuppressionProvenance(t *testing.T) {
+	tests := []struct {
+		name          string
+		cfgName       string
+		fragment      Fragment
+		wantScope     string
+		wantRuleID    string
+		wantSource    string
+		wantFindingID string
+		wantAllowDesc string
+	}{
+		{
+			name:    "rule path allowlist skips fragment",
+			cfgName: "valid/allowlist_rule_path",
+			fragment: Fragment{
+				Raw:      `awsToken := \"AKIALALEMEL33243OLIA\"`,
+				FilePath: "tmp.go",
+			},
+			wantScope:     SuppressionScopeRule,
+			wantRuleID:    "aws-access-key",
+			wantSource:    "allowlist_rule_path.toml",
+			wantFindingID: "", // fragment-level: no finding was produced
+		},
+		{
+			name:    "rule regex allowlist suppresses finding",
+			cfgName: "valid/allowlist_rule_regex",
+			fragment: Fragment{
+				Raw:      `awsToken := \"AKIALALEMEL33243OLIA\"`,
+				FilePath: "tmp.go",
+			},
+			wantScope:     SuppressionScopeRule,
+			wantRuleID:    "aws-access-key",
+			wantSource:    "allowlist_rule_regex.toml",
+			wantFindingID: "aws-access-key",
+		},
+		{
+			name:    "global regex allowlist suppresses finding",
+			cfgName: "valid/allowlist_global_multiple",
+			fragment: Fragment{
+				Raw:      `token = "changeit"`,
+				FilePath: "tmp.go",
+			},
+			wantScope:     SuppressionScopeGlobal,
+			wantRuleID:    "",
+			wantSource:    "allowlist_global_multiple.toml",
+			wantFindingID: "test",
+		},
+		{
+			name:    "extended config global allowlist suppresses finding once",
+			cfgName: "valid/extend_global_allowlist",
+			fragment: Fragment{
+				Raw:      `token = "child-fake-123"`,
+				FilePath: "tmp.go",
+			},
+			wantScope:     SuppressionScopeGlobal,
+			wantRuleID:    "",
+			wantSource:    "extend_global_allowlist.toml",
+			wantFindingID: "child-rule",
+			wantAllowDesc: "shared suppression",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Cleanup(func() { viper.Reset() })
+			cfg := loadDetectorConfig(t, tt.cfgName)
+			d := NewDetector(cfg)
+
+			findings := d.Detect(tt.fragment)
+			require.Empty(t, findings, "finding should have been suppressed")
+
+			suppressions := d.Suppressions()
+			require.Len(t, suppressions, 1,
+				"finding must be suppressed by exactly one allowlist")
+			s := suppressions[0]
+			assert.Equal(t, tt.wantScope, s.Scope)
+			assert.Equal(t, tt.wantRuleID, s.RuleID)
+			assert.Contains(t, s.AllowlistSource, tt.wantSource)
+			assert.Equal(t, tt.wantFindingID, s.Finding.RuleID)
+			assert.Equal(t, tt.fragment.FilePath, s.Finding.File)
+			if tt.wantAllowDesc != "" {
+				assert.Equal(t, tt.wantAllowDesc, s.AllowlistDescription)
+			}
+		})
+	}
+}
+
+// Reloading the same extending config in one process (hot reload, CI retry)
+// must yield detectors that behave identically: extended rules must not
+// silently disappear, and real leaks must keep being reported.
+func TestDetectConsistentAcrossConfigReloads(t *testing.T) {
+	t.Cleanup(func() { viper.Reset() })
+
+	suppressedFragment := Fragment{
+		Raw:      `token = "aebfab88-7596-481d-82e8-c60c8f7de0c0"`,
+		FilePath: "path/to/your/problematic/file.js",
+	}
+	leakFragment := Fragment{
+		Raw:      `token = "aebfab88-7596-481d-82e8-c60c8f7de0c0"`,
+		FilePath: "src/main.go",
+	}
+
+	for generation := 0; generation < 3; generation++ {
+		cfg := loadDetectorConfig(t, "valid/allowlist_rule_extend_default")
+		require.Contains(t, cfg.Rules, "generic-api-key",
+			"generation %d lost the extended rules", generation)
+		d := NewDetector(cfg)
+
+		// The allowlisted finding stays suppressed in every generation.
+		findings := d.Detect(suppressedFragment)
+		require.Empty(t, findings,
+			"generation %d: allowlisted finding should stay suppressed", generation)
+		require.NotEmpty(t, d.Suppressions(),
+			"generation %d: suppression should be recorded", generation)
+
+		// A real leak keeps being reported in every generation.
+		findings = d.Detect(leakFragment)
+		require.NotEmpty(t, findings,
+			"generation %d: real leak was not reported", generation)
+	}
+}
+
 func TestWindowsFileSeparator_RuleAllowlistPaths(t *testing.T) {
 	tests := map[string]struct {
 		fragment Fragment
