@@ -104,6 +104,15 @@ type Detector struct {
 	Reporter   report.Reporter
 
 	TotalBytes atomic.Uint64
+
+	// scanMu serializes scan transactions on the detector. It is held for
+	// the entire lifetime of a DetectSource run so a subsequent scan cannot
+	// begin until the previous one has fully terminated and released its
+	// goroutines and temporary resources.
+	scanMu sync.Mutex
+
+	// nextScanID is the identity assigned to the next accepted scan.
+	nextScanID uint64
 }
 
 // Fragment is an alias for sources.Fragment for backwards compatibility
@@ -127,7 +136,12 @@ func NewDetectorContext(ctx context.Context, cfg config.Config) *Detector {
 		findings:       make([]report.Finding, 0),
 		Config:         cfg,
 		prefilter:      *ahocorasick.NewTrieBuilder().AddStrings(maps.Keys(cfg.Keywords)).Build(),
-		Sema:           semgroup.NewGroup(ctx, 40),
+		// The concurrency limiter must outlive any single scan context:
+		// cancellation is cooperatively honored inside each worker and by
+		// the source walk, not by leaking an acquired semaphore slot. Tying
+		// the group to a per-scan context could leave the semaphore
+		// permanently full after a timeout and deadlock later scans.
+		Sema: semgroup.NewGroup(context.Background(), 40),
 	}
 }
 
@@ -206,6 +220,13 @@ func (d *Detector) DetectString(content string) []report.Finding {
 
 // DetectSource scans the given source and returns a list of findings
 func (d *Detector) DetectSource(ctx context.Context, source sources.Source) ([]report.Finding, error) {
+	// Accept the scan transaction: this freezes the source, the run
+	// identity and the cancellation generation for the whole scan. The
+	// detector-level lock also guarantees a new scan cannot start until a
+	// previous one has completely finished.
+	tx := d.beginScan(ctx, source)
+	defer d.finishScan(tx)
+
 	err := source.Fragments(ctx, func(fragment sources.Fragment, err error) error {
 		logContext := logging.With()
 
@@ -238,6 +259,16 @@ func (d *Detector) DetectSource(ctx context.Context, source sources.Source) ([]r
 			return nil
 		}
 
+		// Stop consuming fragments as soon as the transaction's context is
+		// canceled. Returning the context error unwinds the source, which is
+		// responsible for closing every goroutine and temporary reader it
+		// started before Fragments returns.
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		var timer *time.Timer
 		// Only start the timer in debug mode
 		if logger.GetLevel() <= zerolog.DebugLevel {
@@ -247,7 +278,10 @@ func (d *Detector) DetectSource(ctx context.Context, source sources.Source) ([]r
 		}
 
 		for _, finding := range d.DetectContext(ctx, Fragment(fragment)) {
-			d.AddFinding(finding)
+			// Findings are staged on the transaction. They only become
+			// visible through the detector if the scan commits; a canceled
+			// scan discards them.
+			d.acceptFinding(tx, finding)
 		}
 
 		// Stop the timer if it was created
@@ -258,12 +292,24 @@ func (d *Detector) DetectSource(ctx context.Context, source sources.Source) ([]r
 		return nil
 	})
 
+	// A canceled/failed scan is an aborted transaction: drop every partial
+	// finding instead of committing them, and make sure no late fragment
+	// producer can append anything. Successful scans commit their findings.
+	if err != nil || ctx.Err() != nil {
+		tx.abort()
+		if err == nil {
+			err = ctx.Err()
+		}
+	} else {
+		tx.commit(d)
+	}
+
 	if _, isGit := source.(*sources.Git); isGit {
 		logging.Info().Msgf("%d commits scanned.", len(d.commitMap))
 		logging.Debug().Msg("Note: this number might be smaller than expected due to commits with no additions")
 	}
 
-	return d.Findings(), err
+	return tx.snapshotResult(d), err
 }
 
 // Detect scans the given fragment and returns a list of findings
@@ -709,6 +755,36 @@ func abs(x int) int {
 
 // AddFinding synchronously adds a finding to the findings slice
 func (d *Detector) AddFinding(finding report.Finding) {
+	finding, ok := d.filterFinding(finding)
+	if !ok {
+		return
+	}
+
+	d.findingMutex.Lock()
+	d.findings = append(d.findings, finding)
+	if d.Verbose {
+		printFinding(finding, d.NoColor)
+	}
+	d.findingMutex.Unlock()
+}
+
+// acceptFinding runs the same ignore/baseline filtering as AddFinding but
+// stages the result on the given scan transaction instead of mutating the
+// detector directly, so canceled scans never commit partial findings.
+func (d *Detector) acceptFinding(tx *scanTransaction, finding report.Finding) {
+	finding, ok := d.filterFinding(finding)
+	if !ok {
+		return
+	}
+	if tx.addFinding(finding) && d.Verbose {
+		printFinding(finding, d.NoColor)
+	}
+}
+
+// filterFinding computes the finding fingerprint and applies the
+// .gitleaksignore and baseline filtering. It returns the (possibly
+// fingerprint-enriched) finding and false when it must be dropped.
+func (d *Detector) filterFinding(finding report.Finding) (report.Finding, bool) {
 	globalFingerprint := fmt.Sprintf("%s:%s:%d", finding.File, finding.RuleID, finding.StartLine)
 	if finding.Commit != "" {
 		finding.Fingerprint = fmt.Sprintf("%s:%s:%s:%d", finding.Commit, finding.File, finding.RuleID, finding.StartLine)
@@ -722,14 +798,14 @@ func (d *Detector) AddFinding(finding report.Finding) {
 		logger.Debug().
 			Str("fingerprint", globalFingerprint).
 			Msg("skipping finding: global fingerprint")
-		return
+		return report.Finding{}, false
 	} else if finding.Commit != "" {
 		// Awkward nested if because I'm not sure how to chain these two conditions.
 		if _, ok := d.gitleaksIgnore[finding.Fingerprint]; ok {
 			logger.Debug().
 				Str("fingerprint", finding.Fingerprint).
 				Msgf("skipping finding: fingerprint")
-			return
+			return report.Finding{}, false
 		}
 	}
 
@@ -737,15 +813,10 @@ func (d *Detector) AddFinding(finding report.Finding) {
 		logger.Debug().
 			Str("fingerprint", finding.Fingerprint).
 			Msgf("skipping finding: baseline")
-		return
+		return report.Finding{}, false
 	}
 
-	d.findingMutex.Lock()
-	d.findings = append(d.findings, finding)
-	if d.Verbose {
-		printFinding(finding, d.NoColor)
-	}
-	d.findingMutex.Unlock()
+	return finding, true
 }
 
 // Findings returns the findings added to the detector

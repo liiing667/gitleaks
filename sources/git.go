@@ -307,13 +307,30 @@ func (s *Git) Fragments(ctx context.Context, yield FragmentsFunc) error {
 		diffFilesCh = s.Cmd.DiffFilesCh()
 		errCh       = s.Cmd.ErrCh()
 		wg          sync.WaitGroup
+		// admission bounds worker concurrency in a context-aware way so a
+		// canceled scan stops scheduling instead of blocking on a full
+		// semaphore while existing workers wait for the scan to drain.
+		admission = make(chan struct{}, 40)
+		// cancelErr records why the scan was stopped once the context is
+		// canceled. It is returned after every admitted goroutine has
+		// terminated so no fragment outlives the scan that produced it.
+		cancelErr error
 	)
 
 	// loop to range over both DiffFiles (stdout) and ErrCh (stderr)
+fragmentLoop:
 	for diffFilesCh != nil || errCh != nil {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			// The scan transaction was canceled. Do not return yet: workers
+			// already admitted to the semaphore may still be producing
+			// fragments (including archive blobs backed by temporary
+			// readers). Wait for all of them to observe the cancellation and
+			// close their resources before unwinding.
+			cancelErr = ctx.Err()
+			diffFilesCh = nil
+			errCh = nil
+			break
 		case gitdiffFile, open := <-diffFilesCh:
 			if !open {
 				diffFilesCh = nil
@@ -358,28 +375,66 @@ func (s *Git) Fragments(ctx context.Context, yield FragmentsFunc) error {
 				}
 			}
 
+			// Freeze the per-file identity for this goroutine so concurrent
+			// workers can never read a loop variable that advanced.
+			diffFile := gitdiffFile
+			fileCommitSHA := commitSHA
+			fileCommitInfo := commitInfo
+			fileYieldAsArchive := yieldAsArchive
+
+			// Acquire a worker slot without losing the cancellation signal.
+			select {
+			case <-ctx.Done():
+				cancelErr = ctx.Err()
+				diffFilesCh = nil
+				errCh = nil
+				break fragmentLoop
+			case admission <- struct{}{}:
+			}
+
 			wg.Add(1)
-			s.Sema.Go(func() error {
+			go func() {
+				defer func() { <-admission }()
 				defer wg.Done()
 
-				if yieldAsArchive {
-					blob, err := s.Cmd.NewBlobReaderContext(ctx, commitSHA, gitdiffFile.NewName)
+				// A canceled transaction must not admit or produce any more
+				// fragments.
+				if ctx.Err() != nil {
+					return
+				}
+
+				if fileYieldAsArchive {
+					blob, err := s.Cmd.NewBlobReaderContext(ctx, fileCommitSHA, diffFile.NewName)
 					if err != nil {
 						logging.Error().Err(err).Msg("could not read archive blob")
-						return nil
+						return
 					}
+					// Guarantee the blob reader is closed even when the
+					// fragment walk is interrupted by cancellation; the
+					// explicit Close below still runs on the happy path.
+					closed := false
+					defer func() {
+						if !closed {
+							if closeErr := blob.Close(); closeErr != nil {
+								logging.Debug().Err(closeErr).Msg("blobReader.Close() returned an error")
+							}
+						}
+					}()
 
 					file := File{
 						Content:         blob,
-						Path:            gitdiffFile.NewName,
+						Path:            diffFile.NewName,
 						MaxArchiveDepth: s.MaxArchiveDepth,
 						Config:          s.Config,
 					}
 
 					// enrich and yield fragments
 					err = file.Fragments(ctx, func(fragment Fragment, err error) error {
-						fragment.CommitSHA = commitSHA
-						fragment.CommitInfo = commitInfo
+						if ctx.Err() != nil {
+							return ctx.Err()
+						}
+						fragment.CommitSHA = fileCommitSHA
+						fragment.CommitInfo = fileCommitInfo
 						return yield(fragment, err)
 					})
 
@@ -387,47 +442,57 @@ func (s *Git) Fragments(ctx context.Context, yield FragmentsFunc) error {
 					if err := blob.Close(); err != nil {
 						logging.Debug().Err(err).Msg("blobReader.Close() returned an error")
 					}
+					closed = true
 
-					return err
+					return
 				}
 
-				for _, textFragment := range gitdiffFile.TextFragments {
+				for _, textFragment := range diffFile.TextFragments {
 					if textFragment == nil {
-						return nil
+						return
+					}
+					if ctx.Err() != nil {
+						return
 					}
 
 					fragment := Fragment{
-						CommitSHA:  commitSHA,
-						FilePath:   gitdiffFile.NewName,
+						CommitSHA:  fileCommitSHA,
+						FilePath:   diffFile.NewName,
 						Raw:        textFragment.Raw(gitdiff.OpAdd),
 						StartLine:  int(textFragment.NewPosition),
-						CommitInfo: commitInfo,
+						CommitInfo: fileCommitInfo,
 					}
 
 					if err := yield(fragment, nil); err != nil {
-						return err
+						return
 					}
 				}
 
-				return nil
-			})
+				return
+			}()
 		case err, open := <-errCh:
 			if !open {
 				errCh = nil
 				break
 			}
 
+			if ctx.Err() != nil {
+				// The scan is already being torn down; ignore late stderr.
+				break
+			}
 			return yield(Fragment{}, err)
 		}
 	}
 
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-		wg.Wait()
-		return nil
+	// Wait for every admitted worker (and its archive/temporary readers)
+	// to finish before returning. This is what keeps goroutines and
+	// temporary resources from leaking into a subsequent scan.
+	wg.Wait()
+
+	if cancelErr != nil {
+		return cancelErr
 	}
+	return ctx.Err()
 }
 
 // NewRemoteInfo builds a new RemoteInfo for generating finding links

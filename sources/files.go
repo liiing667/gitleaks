@@ -141,51 +141,83 @@ func (s *Files) scanTargets(ctx context.Context, yield func(ScanTarget, error) e
 // Fragments yields fragments from files discovered under the path
 func (s *Files) Fragments(ctx context.Context, yield FragmentsFunc) error {
 	var wg sync.WaitGroup
+	// admission bounds concurrency like the semaphore group but is
+	// context-aware: when the scan is canceled, scheduling a worker fails
+	// immediately instead of blocking the walk while every existing worker
+	// waits for the walk to drain (which would deadlock).
+	admission := make(chan struct{}, 40)
 
 	err := s.scanTargets(ctx, func(scanTarget ScanTarget, err error) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case admission <- struct{}{}:
+			// A worker slot was acquired.
 		default:
-			wg.Add(1)
-			s.Sema.Go(func() error {
-				logger := logging.With().Str("path", scanTarget.Path).Logger()
-				logger.Trace().Msg("scanning path")
-
-				f, err := os.Open(scanTarget.Path)
-				if err != nil {
-					if os.IsPermission(err) {
-						logger.Warn().Msg("skipping file: permission denied")
-					}
-					wg.Done()
-					return nil
-				}
-
-				// Convert this to a file source
-				file := File{
-					Content:         f,
-					Path:            scanTarget.Path,
-					Symlink:         scanTarget.Symlink,
-					Config:          s.Config,
-					MaxArchiveDepth: s.MaxArchiveDepth,
-				}
-
-				err = file.Fragments(ctx, yield)
-				// Avoiding a defer in a hot loop
-				_ = f.Close()
-				wg.Done()
-				return err
-			})
-
-			return nil
+			// No free slot right now; wait for one without losing the
+			// cancellation signal.
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case admission <- struct{}{}:
+			}
 		}
+
+		wg.Add(1)
+		go func() {
+			defer func() { <-admission }()
+			defer wg.Done()
+
+			logger := logging.With().Str("path", scanTarget.Path).Logger()
+			logger.Trace().Msg("scanning path")
+
+			if ctx.Err() != nil {
+				return
+			}
+
+			f, err := os.Open(scanTarget.Path)
+			if err != nil {
+				if os.IsPermission(err) {
+					logger.Warn().Msg("skipping file: permission denied")
+				}
+				return
+			}
+			// Guarantee the file handle is released even when the
+			// fragment walk is interrupted by cancellation; the explicit
+			// Close below still runs on the happy path.
+			closed := false
+			defer func() {
+				if !closed {
+					_ = f.Close()
+				}
+			}()
+
+			// Convert this to a file source
+			file := File{
+				Content:         f,
+				Path:            scanTarget.Path,
+				Symlink:         scanTarget.Symlink,
+				Config:          s.Config,
+				MaxArchiveDepth: s.MaxArchiveDepth,
+			}
+
+			err = file.Fragments(ctx, yield)
+			// Avoiding a defer in a hot loop
+			_ = f.Close()
+			closed = true
+			_ = err
+		}()
+
+		return nil
 	})
 
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-		wg.Wait()
-		return err
+	// Wait for every admitted worker (and its archive/temporary readers)
+	// to finish before returning so goroutines and temporary resources can
+	// never leak into a subsequent scan.
+	wg.Wait()
+
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
 	}
+	return err
 }

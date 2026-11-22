@@ -461,7 +461,10 @@ func findingSummaryAndExit(detector *detect.Detector, findings []report.Finding,
 	}
 
 	// write report if desired
-	if detector.Reporter != nil {
+	// A canceled or otherwise failed scan is an aborted transaction and must
+	// never produce a report from partial findings. Only a fully committed
+	// scan is allowed to terminate into a report.
+	if detector.Reporter != nil && err == nil {
 		var (
 			file      io.WriteCloser
 			reportErr error
