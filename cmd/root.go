@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -348,12 +347,15 @@ func Detector(cmd *cobra.Command, cfg config.Config, source string) *detect.Dete
 	reportPath := mustGetStringFlag(cmd, "report-path")
 	if reportPath != "" {
 		if reportPath != report.StdoutReportPath {
-			// Ensure the path is writable.
-			if f, err := os.Create(reportPath); err != nil {
+			// Ensure the report directory is writable without touching an
+			// existing complete report. A failed scan must leave the previous
+			// baseline available for the next attempt.
+			if f, err := os.CreateTemp(filepath.Dir(reportPath), "."+filepath.Base(reportPath)+".check-*"); err != nil {
 				logging.Fatal().Err(err).Msgf("Report path is not writable: %s", reportPath)
 			} else {
+				name := f.Name()
 				_ = f.Close()
-				_ = os.Remove(reportPath)
+				_ = os.Remove(name)
 			}
 		}
 
@@ -462,30 +464,7 @@ func findingSummaryAndExit(detector *detect.Detector, findings []report.Finding,
 
 	// write report if desired
 	if detector.Reporter != nil {
-		var (
-			file      io.WriteCloser
-			reportErr error
-		)
-
-		if detector.ReportPath == report.StdoutReportPath {
-			file = os.Stdout
-		} else {
-			// Open the file.
-			if file, reportErr = os.Create(detector.ReportPath); reportErr != nil {
-				goto ReportEnd
-			}
-			defer func() {
-				_ = file.Close()
-			}()
-		}
-
-		// Write to the file.
-		if reportErr = detector.Reporter.Write(file, findings); reportErr != nil {
-			goto ReportEnd
-		}
-
-	ReportEnd:
-		if reportErr != nil {
+		if reportErr := detector.WriteReport(findings); reportErr != nil {
 			logging.Fatal().Err(reportErr).Msg("failed to write report")
 		}
 	}

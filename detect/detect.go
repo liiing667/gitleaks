@@ -3,7 +3,6 @@ package detect
 import (
 	"bufio"
 	"context"
-	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -395,13 +394,17 @@ func (d *Detector) detectRule(fragment Fragment, currentRaw string, r config.Rul
 			// Path _only_ rule
 			if r.Path.MatchString(fragment.FilePath) || (fragment.WindowsFilePath != "" && r.Path.MatchString(fragment.WindowsFilePath)) {
 				finding := report.Finding{
-					Commit:      fragment.CommitSHA,
-					RuleID:      r.RuleID,
-					Description: r.Description,
-					File:        fragment.FilePath,
-					SymlinkFile: fragment.SymlinkFile,
-					Match:       "file detected: " + fragment.FilePath,
-					Tags:        r.Tags,
+					Commit:           fragment.CommitSHA,
+					RuleID:           r.RuleID,
+					Description:      r.Description,
+					File:             fragment.FilePath,
+					SymlinkFile:      fragment.SymlinkFile,
+					PreviousFile:     fragment.PreviousFilePath,
+					PreviousFilePath: fragment.PreviousFilePath,
+					OriginalFile:     fragment.OriginalFilePath,
+					SourceGeneration: fragment.SourceGeneration,
+					Match:            "file detected: " + fragment.FilePath,
+					Tags:             r.Tags,
 				}
 				if fragment.CommitInfo != nil {
 					finding.Author = fragment.CommitInfo.AuthorName
@@ -486,19 +489,23 @@ func (d *Detector) detectRule(fragment Fragment, currentRaw string, r config.Rul
 		}
 
 		finding := report.Finding{
-			Commit:      fragment.CommitSHA,
-			RuleID:      r.RuleID,
-			Description: r.Description,
-			StartLine:   fragment.StartLine + loc.startLine,
-			EndLine:     fragment.StartLine + loc.endLine,
-			StartColumn: loc.startColumn,
-			EndColumn:   loc.endColumn,
-			Line:        fragment.Raw[loc.startLineIndex:loc.endLineIndex],
-			Match:       secret,
-			Secret:      secret,
-			File:        fragment.FilePath,
-			SymlinkFile: fragment.SymlinkFile,
-			Tags:        append(r.Tags, metaTags...),
+			Commit:           fragment.CommitSHA,
+			RuleID:           r.RuleID,
+			Description:      r.Description,
+			StartLine:        fragment.StartLine + loc.startLine,
+			EndLine:          fragment.StartLine + loc.endLine,
+			StartColumn:      loc.startColumn,
+			EndColumn:        loc.endColumn,
+			Line:             fragment.Raw[loc.startLineIndex:loc.endLineIndex],
+			Match:            secret,
+			Secret:           secret,
+			File:             fragment.FilePath,
+			SymlinkFile:      fragment.SymlinkFile,
+			PreviousFile:     fragment.PreviousFilePath,
+			PreviousFilePath: fragment.PreviousFilePath,
+			OriginalFile:     fragment.OriginalFilePath,
+			SourceGeneration: fragment.SourceGeneration,
+			Tags:             append(r.Tags, metaTags...),
 		}
 		if fragment.CommitInfo != nil {
 			finding.Author = fragment.CommitInfo.AuthorName
@@ -709,11 +716,15 @@ func abs(x int) int {
 
 // AddFinding synchronously adds a finding to the findings slice
 func (d *Detector) AddFinding(finding report.Finding) {
-	globalFingerprint := fmt.Sprintf("%s:%s:%d", finding.File, finding.RuleID, finding.StartLine)
-	if finding.Commit != "" {
-		finding.Fingerprint = fmt.Sprintf("%s:%s:%s:%d", finding.Commit, finding.File, finding.RuleID, finding.StartLine)
-	} else {
-		finding.Fingerprint = globalFingerprint
+	globalFingerprint := report.GlobalFingerprint(finding)
+	finding.Fingerprint = report.FindingFingerprint(finding)
+
+	// Redaction happens later in filter(), but baseline matching needs the
+	// pre-redaction identity. Only persist the digest when this scan will
+	// actually redact the output, keeping existing unredacted reports stable.
+	if d.Redact > 0 &&
+		finding.Secret != "" && !report.IsRedactedValue(finding.Secret) {
+		finding.SecretHash = report.HashSecret(finding.Secret)
 	}
 
 	// check if we should ignore this finding
@@ -751,6 +762,36 @@ func (d *Detector) AddFinding(finding report.Finding) {
 // Findings returns the findings added to the detector
 func (d *Detector) Findings() []report.Finding {
 	return d.findings
+}
+
+// WriteReport writes findings to the detector's configured report path.
+//
+// Fingerprints are derived from the finding's own source generation at write
+// time, so a stale fingerprint carried in by a caller cannot make the report
+// and its baseline disagree. File reports are committed atomically.
+func (d *Detector) WriteReport(findings []report.Finding) error {
+	if d.Reporter == nil {
+		return nil
+	}
+
+	normalized := d.ReportFindings(findings)
+
+	if d.ReportPath == report.StdoutReportPath {
+		return d.Reporter.Write(os.Stdout, normalized)
+	}
+	return report.WriteFile(d.ReportPath, d.Reporter, normalized)
+}
+
+// ReportFindings returns a copy of findings with fingerprints derived from
+// the same source generation used by the baseline. It does not mutate the
+// caller's findings.
+func (d *Detector) ReportFindings(findings []report.Finding) []report.Finding {
+	normalized := make([]report.Finding, len(findings))
+	for i, finding := range findings {
+		finding.Fingerprint = report.FindingFingerprint(finding)
+		normalized[i] = finding
+	}
+	return normalized
 }
 
 // AddCommit synchronously adds a commit to the commit slice

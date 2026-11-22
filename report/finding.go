@@ -1,6 +1,8 @@
 package report
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"math"
 	"strings"
@@ -28,11 +30,35 @@ type Finding struct {
 	// Captured secret
 	Secret string
 
+	// SecretHash is a stable, non-reversible identity for the unredacted
+	// secret. It is persisted with redacted findings so a baseline can tell an
+	// unchanged secret from a rotated one without storing the plaintext value.
+	SecretHash string `json:",omitempty"`
+
 	// File is the name of the file containing the finding
 	File        string
 	SymlinkFile string
 	Commit      string
 	Link        string `json:",omitempty"`
+
+	// PreviousFile is the path the file was renamed from in the scanned
+	// generation. PreviousFilePath is kept as an alias for source adapters
+	// that use path-oriented names.
+	PreviousFile     string `json:",omitempty"`
+	PreviousFilePath string `json:",omitempty"`
+
+	// OriginalFile is the oldest known name of the source. It lets baseline
+	// matching follow more than one rename without treating unrelated files as
+	// the same source.
+	OriginalFile string `json:",omitempty"`
+
+	// SourceGeneration identifies the immutable source revision that produced
+	// the finding. ScanGeneration is an alias used by scan-oriented callers.
+	// SourceCommit records the revision separately from Commit for consumers
+	// that need both the finding's commit and its source generation.
+	SourceGeneration string `json:",omitempty"`
+	ScanGeneration   string `json:",omitempty"`
+	SourceCommit     string `json:",omitempty"`
 
 	// Entropy is the shannon entropy of Value
 	Entropy float32
@@ -52,6 +78,57 @@ type Finding struct {
 
 	// TODO keeping private for now to during experimental phase
 	requiredFindings []*RequiredFinding
+}
+
+// HashSecret returns the hexadecimal SHA-256 digest of a secret. An optional
+// match context can be supplied to produce a context-bound digest for legacy
+// baselines.
+func HashSecret(secret string, match ...string) string {
+	if secret == "" {
+		return ""
+	}
+
+	hasher := sha256.New()
+	_, _ = hasher.Write([]byte(secret))
+	if len(match) > 0 && match[0] != "" {
+		_, _ = hasher.Write([]byte{0})
+		_, _ = hasher.Write([]byte(match[0]))
+	}
+	return hex.EncodeToString(hasher.Sum(nil))
+}
+
+// IsRedactedValue reports whether a persisted value was produced by one of
+// gitleaks' redaction modes.
+func IsRedactedValue(value string) bool {
+	return value == "REDACTED" ||
+		strings.HasSuffix(value, "...") ||
+		(value != "" && strings.Trim(value, "*") == "")
+}
+
+// Generation returns the immutable source generation recorded for the
+// finding. Older reports have no explicit generation and fall back to Commit.
+func (f Finding) Generation() string {
+	switch {
+	case f.SourceGeneration != "":
+		return f.SourceGeneration
+	case f.ScanGeneration != "":
+		return f.ScanGeneration
+	case f.SourceCommit != "":
+		return f.SourceCommit
+	default:
+		return f.Commit
+	}
+}
+
+// RenamedFrom returns the path recorded as the previous name of the file.
+func (f Finding) RenamedFrom() string {
+	if f.PreviousFile != "" {
+		return f.PreviousFile
+	}
+	if f.PreviousFilePath != "" {
+		return f.PreviousFilePath
+	}
+	return f.OriginalFile
 }
 
 type RequiredFinding struct {
@@ -76,6 +153,13 @@ func (f *Finding) AddRequiredFindings(afs []*RequiredFinding) {
 
 // Redact removes sensitive information from a finding.
 func (f *Finding) Redact(percent uint) {
+	if f.Secret != "" && IsRedactedValue(f.Secret) {
+		return
+	}
+	if f.Secret != "" {
+		f.SecretHash = HashSecret(f.Secret)
+	}
+
 	secret := maskSecret(f.Secret, percent)
 	if percent >= 100 {
 		secret = "REDACTED"

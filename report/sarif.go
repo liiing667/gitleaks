@@ -97,9 +97,13 @@ func getResults(findings []Finding) []Results {
 				CommitMessage: f.Message,
 				Date:          f.Date,
 				Author:        f.Author,
+				Fingerprint:   f.Fingerprint,
 			},
 			Properties: Properties{
-				Tags: f.Tags,
+				Tags:             f.Tags,
+				SecretHash:       f.SecretHash,
+				SourceGeneration: explicitSourceGeneration(f),
+				PreviousFile:     f.RenamedFrom(),
 			},
 		}
 		results = append(results, r)
@@ -138,6 +142,7 @@ type PartialFingerPrints struct {
 	Author        string `json:"author"`
 	Date          string `json:"date"`
 	CommitMessage string `json:"commitMessage"`
+	Fingerprint   string `json:"fingerprint,omitempty"`
 }
 
 type Sarif struct {
@@ -200,7 +205,10 @@ type Locations struct {
 }
 
 type Properties struct {
-	Tags []string `json:"tags"`
+	Tags             []string `json:"tags"`
+	SecretHash       string   `json:"secretHash,omitempty"`
+	SourceGeneration string   `json:"sourceGeneration,omitempty"`
+	PreviousFile     string   `json:"previousFile,omitempty"`
 }
 
 type Results struct {

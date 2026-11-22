@@ -324,6 +324,13 @@ func (s *Git) Fragments(ctx context.Context, yield FragmentsFunc) error {
 				continue
 			}
 
+			previousFilePath := ""
+			if gitdiffFile.OldName != "" &&
+				gitdiffFile.OldName != gitdiffFile.NewName &&
+				gitdiffFile.OldName != "/dev/null" {
+				previousFilePath = gitdiffFile.OldName
+			}
+
 			// skip non-archive binary files
 			yieldAsArchive := false
 			if gitdiffFile.IsBinary {
@@ -380,6 +387,12 @@ func (s *Git) Fragments(ctx context.Context, yield FragmentsFunc) error {
 					err = file.Fragments(ctx, func(fragment Fragment, err error) error {
 						fragment.CommitSHA = commitSHA
 						fragment.CommitInfo = commitInfo
+						fragment.PreviousFilePath = renamedMemberPath(
+							previousFilePath,
+							gitdiffFile.NewName,
+							fragment.FilePath,
+						)
+						fragment.OriginalFilePath = fragment.PreviousFilePath
 						return yield(fragment, err)
 					})
 
@@ -397,11 +410,13 @@ func (s *Git) Fragments(ctx context.Context, yield FragmentsFunc) error {
 					}
 
 					fragment := Fragment{
-						CommitSHA:  commitSHA,
-						FilePath:   gitdiffFile.NewName,
-						Raw:        textFragment.Raw(gitdiff.OpAdd),
-						StartLine:  int(textFragment.NewPosition),
-						CommitInfo: commitInfo,
+						CommitSHA:        commitSHA,
+						FilePath:         gitdiffFile.NewName,
+						PreviousFilePath: previousFilePath,
+						OriginalFilePath: previousFilePath,
+						Raw:              textFragment.Raw(gitdiff.OpAdd),
+						StartLine:        int(textFragment.NewPosition),
+						CommitInfo:       commitInfo,
 					}
 
 					if err := yield(fragment, nil); err != nil {
@@ -428,6 +443,16 @@ func (s *Git) Fragments(ctx context.Context, yield FragmentsFunc) error {
 		wg.Wait()
 		return nil
 	}
+}
+
+func renamedMemberPath(previousContainer, currentContainer, member string) string {
+	if previousContainer == "" || previousContainer == currentContainer {
+		return ""
+	}
+	if strings.HasPrefix(member, currentContainer+"!") {
+		return previousContainer + strings.TrimPrefix(member, currentContainer)
+	}
+	return previousContainer
 }
 
 // NewRemoteInfo builds a new RemoteInfo for generating finding links

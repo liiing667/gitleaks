@@ -205,6 +205,13 @@ gitleaks git --baseline-path gitleaks-report.json --report-path findings.json
 
 After running the detect command with the --baseline-path parameter, report output (findings.json) will only contain new issues.
 
+Baseline entries are matched by rule, secret identity, and source generation
+rather than by path alone. Git rename provenance keeps an unchanged secret from
+being reported again after a file move, while a changed secret or a stale
+entry from another commit remains a new finding. Reports and baselines use the
+same fingerprint calculation, and report files are replaced atomically so a
+failed or interrupted write cannot leave a partial baseline behind.
+
 ## Pre-Commit hook
 
 You can run Gitleaks as a pre-commit hook by copying the example `pre-commit.py` script into
